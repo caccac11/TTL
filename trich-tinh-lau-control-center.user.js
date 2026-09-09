@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trích Tinh Lâu - Control Center Toàn Diện
 // @namespace    https://github.com/caccac11/TTL
-// @version      1.2.2
+// @version      1.2.3
 // @description  Control Center quản lý truyện + chương + bulk update/create/fix giá + doanh thu. Một chức năng chỉ giữ một workflow tối ưu; đọc form/route thật từ server.
 // @match        https://trichtinhlau.com/*
 // @homepageURL  https://github.com/caccac11/TTL
@@ -24,7 +24,7 @@
   if (window.__TTL_CONTROL_CENTER__) return;
   window.__TTL_CONTROL_CENTER__ = true;
 
-  const VERSION = '1.2.2';
+  const VERSION = '1.2.3';
   const ORIGIN = location.origin;
   const STORE_KEY = 'ttl-control-center-v1';
 
@@ -992,71 +992,125 @@
     renderDashboard();
   }
 
-  async function loadStoryEditor(mode = 'edit') {
+  async function loadStoryEditor() {
     const host = $('#ttlcc-story-editor');
     if (!host) return;
 
-    if (mode === 'edit' && !state.selectedStoryId) {
+    if (!state.selectedStoryId) {
       return toast('Chưa chọn truyện.', 'warn');
     }
 
-    host.innerHTML = '<div class="ttlcc-loading">Đang đọc form thật từ server…</div>';
+    host.innerHTML =
+      '<div class="ttlcc-loading">Đang đọc form thật từ server…</div>';
 
-    const url = mode === 'create'
-      ? routeUrl('/truyen/create')
-      : routeUrl(`/truyen/${state.selectedStoryId}/edit`);
+    const url =
+      routeUrl(`/truyen/${state.selectedStoryId}/edit`);
 
     try {
-      const { doc, finalUrl } = await fetchDoc(url, mode === 'create' ? 'GET form tạo truyện' : 'GET form sửa truyện');
-      const form = [...doc.forms].find(f => {
-        const action = new URL(f.getAttribute('action') || '', finalUrl).pathname;
-        return f.querySelector('[name="tentruyen"]') && (
-          mode === 'create' ? action === '/truyen' : /^\/truyen\/\d+$/.test(action)
+      const { doc, finalUrl } =
+        await fetchDoc(
+          url,
+          'GET form sửa truyện'
         );
-      });
 
-      if (!form) throw new Error('Không tìm thấy form truyện có field tentruyen.');
+      const form =
+        [...doc.forms].find(f => {
+          const action =
+            new URL(
+              f.getAttribute('action') || '',
+              finalUrl
+            ).pathname;
 
-      const model = formToModel(form, finalUrl);
+          return (
+            f.querySelector('[name="tentruyen"]') &&
+            /^\/truyen\/\d+$/.test(action)
+          );
+        });
+
+      if (!form) {
+        throw new Error(
+          'Không tìm thấy form sửa truyện có field tentruyen.'
+        );
+      }
+
+      const model =
+        formToModel(form, finalUrl);
+
       state.storyEditorModel = model;
 
       renderLiveForm(host, model, {
-        title: mode === 'create' ? 'Tạo truyện mới' : `Sửa truyện #${state.selectedStoryId}`,
-        submitText: mode === 'create' ? 'Tạo truyện' : 'Lưu thay đổi',
-        onSubmit: async (uiForm, liveModel, btn) => {
-          const action = mode === 'create' ? 'TẠO TRUYỆN MỚI' : `LƯU TRUYỆN #${state.selectedStoryId}`;
-          if (!confirm(`${action}\n\nScript sẽ gửi đúng form vừa đọc từ server. Tiếp tục?`)) return;
+        title:
+          `Sửa truyện #${state.selectedStoryId}`,
+        submitText: 'Lưu thay đổi',
 
-          btn.disabled = true;
-          try {
-            const res = await submitRenderedForm(uiForm, liveModel, action);
-            toast(`${action}: server đã nhận yêu cầu. Đang re-check…`, 'ok');
+        onSubmit:
+          async (
+            uiForm,
+            liveModel,
+            btn
+          ) => {
+            const action =
+              `LƯU TRUYỆN #${state.selectedStoryId}`;
 
-            await sleep(500);
-            await loadStories();
-
-            if (mode === 'edit') {
-              await loadStoryEditor('edit');
-            } else {
-              switchTab('stories');
+            if (
+              !confirm(
+                `${action}\n\n` +
+                'Script sẽ gửi đúng form vừa đọc từ server. Tiếp tục?'
+              )
+            ) {
+              return;
             }
-          } catch (err) {
-            toast(`${action} lỗi: ${err.message}`, 'error', 6000);
-          } finally {
-            btn.disabled = false;
-          }
-        },
+
+            btn.disabled = true;
+
+            try {
+              await submitRenderedForm(
+                uiForm,
+                liveModel,
+                action
+              );
+
+              toast(
+                `${action}: server đã nhận yêu cầu. Đang re-check…`,
+                'ok'
+              );
+
+              await sleep(500);
+              await loadStories();
+              await loadStoryEditor();
+            } catch (err) {
+              toast(
+                `${action} lỗi: ${err.message}`,
+                'error',
+                6000
+              );
+            } finally {
+              btn.disabled = false;
+            }
+          },
       });
     } catch (err) {
       host.innerHTML = `
         <div class="ttlcc-error-box">
           Không dựng được form tùy biến: ${esc(err.message)}
-          <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-story-native-fallback" type="button">Mở form gốc trong Control Center</button>
+          <button
+            class="ttlcc-btn ttlcc-btn-soft"
+            id="ttlcc-story-native-fallback"
+            type="button"
+          >
+            Mở form gốc trong Control Center
+          </button>
         </div>`;
-      $('#ttlcc-story-native-fallback')?.addEventListener(
-        'click',
-        () => openNativeTool(url, 'Form truyện gốc')
-      );
+
+      $('#ttlcc-story-native-fallback')
+        ?.addEventListener(
+          'click',
+          () =>
+            openNativeTool(
+              url,
+              'Form truyện gốc'
+            )
+        );
     }
   }
 
@@ -3135,7 +3189,7 @@
         <section class="ttlcc-pane" data-pane="stories">
           <div class="ttlcc-grid2">
             <div class="ttlcc-card">
-              <div class="ttlcc-card-title"><span>Danh sách truyện</span><button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-primary" id="ttlcc-create-story" type="button">+ Tạo truyện</button></div>
+              <div class="ttlcc-card-title"><span>Danh sách truyện</span></div>
               <div class="ttlcc-toolbar">
                 <input class="ttlcc-input" id="ttlcc-story-filter" type="text" placeholder="Lọc tên / ID…" style="flex:1;min-width:120px">
                 <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-story-server-search" type="button">Tìm server</button>
@@ -3397,8 +3451,7 @@
       if (!q) return loadStories();
       loadStories({ serverSearch: true, query: q }).catch(err => toast(`Tìm server lỗi: ${err.message}`, 'error'));
     };
-    $('#ttlcc-create-story').onclick = () => loadStoryEditor('create');
-    $('#ttlcc-edit-story').onclick = () => loadStoryEditor('edit');
+    $('#ttlcc-edit-story').onclick = () => loadStoryEditor();
     $('#ttlcc-publish-story').onclick = togglePublishSelected;
 
     $('#ttlcc-chapter-filter').addEventListener('input', renderChapters);
@@ -3499,8 +3552,7 @@
     selectStory,
     openChapter: openChapterEditor,
     createChapter: openCreateChapter,
-    editStory: () => loadStoryEditor('edit'),
-    createStory: () => loadStoryEditor('create'),
+    editStory: () => loadStoryEditor(),
     openRevenue: () => {
       switchTab('revenue');
       return loadRevenueData({ force: true });
