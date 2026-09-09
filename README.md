@@ -6,20 +6,9 @@ Userscript Tampermonkey giúp gom các chức năng quản lý truyện và chư
 
 Yêu cầu trình duyệt đã cài **Tampermonkey**.
 
-### Cài trực tiếp
-
 [Nhấn vào đây để cài userscript](https://raw.githubusercontent.com/caccac11/TTL/main/trich-tinh-lau-control-center.user.js)
 
 Tampermonkey sẽ tự mở màn hình cài đặt.
-
-### Cài thủ công
-
-1. Tải file `trich-tinh-lau-control-center.user.js`.
-2. Mở Tampermonkey.
-3. Chọn **Create a new script**.
-4. Dán toàn bộ nội dung file vào.
-5. Save.
-6. Mở `https://trichtinhlau.com/` và đăng nhập tài khoản của bạn.
 
 ---
 
