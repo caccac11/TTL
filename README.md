@@ -29,7 +29,6 @@ Hiển thị nhanh tình trạng truyện đang chọn:
 - tải danh sách truyện;
 - lọc nhanh theo tên hoặc ID;
 - tìm truyện bằng chức năng search của server;
-- tạo truyện;
 - sửa metadata truyện;
 - publish / tạm ẩn;
 - đọc form thật từ server thay vì hardcode field cố định.
