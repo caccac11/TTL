@@ -129,21 +129,6 @@ Script không chứa cookie, mật khẩu, CSRF token hoặc ID tài khoản c�
 
 ---
 
-## Cập nhật
-
-Userscript có cấu hình auto-update từ GitHub.
-
-Khi phát hành bản mới:
-
-1. tăng `@version`;
-2. cập nhật file:
-   `trich-tinh-lau-control-center.user.js`
-3. commit lên nhánh `main`.
-
-Tampermonkey của người dùng sẽ kiểm tra bản mới theo `@updateURL`.
-
----
-
 ## Repository
 
 https://github.com/caccac11/TTL
