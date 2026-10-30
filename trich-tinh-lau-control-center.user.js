@@ -1,9 +1,13 @@
 // ==UserScript==
-// @name         Yến Tinh Lâu - Control Center
-// @namespace    local.ytl.control-center
-// @version      0.3.3
-// @description  Quản lý truyện/chương, bulk create native, bulk update rolling, verify/reconcile và thống kê cho yentinhlau.xyz.
-// @match        https://yentinhlau.xyz/*
+// @name         Trích Tinh Lâu - Control Center Toàn Diện
+// @namespace    https://github.com/caccac11/TTL
+// @version      1.2.4
+// @description  Control Center quản lý truyện + chương + bulk update/create/fix giá + doanh thu. Một chức năng chỉ giữ một workflow tối ưu; đọc form/route thật từ server.
+// @match        https://trichtinhlau.com/*
+// @homepageURL  https://github.com/caccac11/TTL
+// @supportURL   https://github.com/caccac11/TTL/issues
+// @updateURL    https://raw.githubusercontent.com/caccac11/TTL/main/trich-tinh-lau-control-center.user.js
+// @downloadURL  https://raw.githubusercontent.com/caccac11/TTL/main/trich-tinh-lau-control-center.user.js
 // @noframes
 // @grant        none
 // @run-at       document-idle
@@ -12,66 +16,101 @@
 (() => {
   'use strict';
 
+  // Không bao giờ inject Control Center bên trong iframe.
+  // Doanh thu dùng iframe cùng domain; nếu không chặn, userscript sẽ
+  // tự tạo Control Center lồng trong Control Center.
   if (window.top !== window.self) return;
-  if (window.__YTL_CONTROL_CENTER__) return;
-  window.__YTL_CONTROL_CENTER__ = true;
 
-  const VERSION = '0.3.3';
+  if (window.__TTL_CONTROL_CENTER__) return;
+  window.__TTL_CONTROL_CENTER__ = true;
+
+  const VERSION = '1.2.4';
   const ORIGIN = location.origin;
-  const STORE_KEY = 'ytl-control-center-v1';
+  const STORE_KEY = 'ttl-control-center-v1';
+
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const jitter = max => Math.floor(Math.random() * Math.max(0, max));
+  const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 
   const CFG = {
-    timeoutMs: 25000,
-    getAttempts: 3,
+    getAttempts: 4,
+    getTimeoutMs: 25000,
     retryBaseMs: 900,
-
-    // Rolling update an toàn. Có thể nâng sau khi đo thực tế.
-    writeConcurrency: 2,
-    writeGapMs: 350,
-    verifyAttempts: 3,
-    verifyDelayMs: 700,
-
-    // Native bulk create: 1 POST/chunk, không bắn từng chương.
-    createChunkSize: 100,
-
-    maxLogLines: 500,
+    requestGapMs: 800,
+    bulkCooldownEvery: 10,
+    bulkCooldownMs: 3500,
+    maxPreviewRows: 250,
+    maxLogLines: 600,
+    pricing: {
+      minPaidWords: 1000,
+      maxStars: 10,
+      maxDiamonds: 1,
+    },
   };
 
   const state = {
-    opened: false,
-    activeTab: 'stories',
-    theme: 'dark',
-    running: false,
-    cancelled: false,
-
     stories: new Map(),
+    storySearchForm: null,
     selectedStoryId: null,
     selectedStory: null,
-
+    storyEditorModel: null,
+    chapterCreateModel: null,
     chapters: [],
     chapterMap: new Map(),
-
-    stats: null,
-
+    chapterHeaderMap: {},
+    chapterLoading: false,
+    running: false,
+    cancelled: false,
+    snapshotCache: new Map(),
     bulk: {
       parsed: [],
-      mode: 'create',
-      price: 0,
-      password: '',
-      hPassword: '',
-      delayMs: 350,
+      pricing: new Map(),
+      existingPricing: new Map(),
+      operation: 'price_update',
     },
-
     log: [],
+    activeTab: 'dashboard',
+
+    revenue: {
+      loaded: false,
+      loading: false,
+      updatedAt: null,
+      error: '',
+      period: '',
+      totalKC: null,
+      totalSales: null,
+      monthKC: null,
+      balanceKC: null,
+      withdrawableVnd: null,
+      withdrawPackage: null,
+      minWithdrawPackage: null,
+      stories: [],
+    },
   };
 
-  const $ = (s, r = document) => r.querySelector(s);
-  const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
+  // ==========================================================
+  // COMMON
+  // ==========================================================
 
-  function esc(v) {
-    return String(v ?? '')
+  function text(value) {
+    return String(value ?? '')
+      .replace(/\u00A0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function norm(value) {
+    return text(value)
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/đ/g, 'd');
+  }
+
+  function esc(value) {
+    return String(value ?? '')
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
@@ -79,15 +118,8 @@
       .replace(/'/g, '&#039;');
   }
 
-  function text(v) {
-    return String(v ?? '')
-      .replace(/\u00A0/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
   function nowTime() {
-    return new Date().toLocaleTimeString('vi-VN');
+    return new Date().toLocaleTimeString();
   }
 
   function addLog(message, level = 'info') {
@@ -97,48 +129,49 @@
       level,
       message: String(message),
     };
+
     state.log.push(item);
     if (state.log.length > CFG.maxLogLines) {
       state.log.splice(0, state.log.length - CFG.maxLogLines);
     }
 
-    const host = $('#ytlcc-log');
-    if (host) {
+    const box = $('#ttlcc-log');
+    if (box) {
       const line = document.createElement('div');
-      line.className = `ytlcc-log-line ${level}`;
+      line.className = `ttlcc-log-line ${level}`;
       line.textContent = `[${item.time}] ${item.message}`;
-      host.appendChild(line);
-      while (host.children.length > CFG.maxLogLines) host.firstChild.remove();
-      host.scrollTop = host.scrollHeight;
+      box.appendChild(line);
+      while (box.children.length > CFG.maxLogLines) box.firstChild.remove();
+      box.scrollTop = box.scrollHeight;
     }
 
     console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](
-      '[YTL Control Center]',
-      message
+      `[TTL Control Center] ${message}`
     );
   }
 
   function toast(message, level = 'info', timeout = 3200) {
-    addLog(message, level);
-    const host = $('#ytlcc-toast-host');
-    if (!host) return;
+    let host = $('#ttlcc-toast-host');
+    if (!host) return addLog(message, level);
 
     const el = document.createElement('div');
-    el.className = `ytlcc-toast ${level}`;
-    el.textContent = String(message);
+    el.className = `ttlcc-toast ${level}`;
+    el.textContent = message;
     host.appendChild(el);
 
     setTimeout(() => {
       el.classList.add('out');
-      setTimeout(() => el.remove(), 180);
+      setTimeout(() => el.remove(), 220);
     }, timeout);
+
+    addLog(message, level);
   }
 
   function setStatus(message, level = 'info') {
-    const el = $('#ytlcc-status');
+    const el = $('#ttlcc-status');
     if (!el) return;
+    el.className = `ttlcc-status ${level}`;
     el.textContent = message;
-    el.dataset.level = level;
   }
 
   function savePrefs() {
@@ -148,8 +181,7 @@
         JSON.stringify({
           selectedStoryId: state.selectedStoryId,
           activeTab: state.activeTab,
-          theme: state.theme,
-          hPassword: state.bulk.hPassword,
+          minimized: $('#ttlcc-panel')?.classList.contains('ttlcc-minimized') || false,
         })
       );
     } catch {}
@@ -157,959 +189,1378 @@
 
   function loadPrefs() {
     try {
-      return JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
+      const prefs = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
+
+      // Migration từ v1.0: tab "tools" đã được rút gọn thành "revenue".
+      if (prefs.activeTab === 'tools') {
+        prefs.activeTab = 'revenue';
+      }
+
+      return prefs;
     } catch {
       return {};
     }
   }
 
-  function applyTheme(theme = state.theme) {
-    state.theme = theme === 'light' ? 'light' : 'dark';
-    document.documentElement.setAttribute('data-ytlcc-theme', state.theme);
-
-    const btn = $('#ytlcc-theme-toggle');
-    if (btn) {
-      btn.textContent = state.theme === 'dark' ? 'Night' : 'Light';
-      btn.title =
-        state.theme === 'dark'
-          ? 'Night mode đang bật. Bấm để chuyển sang Light.'
-          : 'Light mode đang bật. Bấm để chuyển sang Night.';
-      btn.setAttribute('aria-pressed', state.theme === 'dark' ? 'true' : 'false');
-    }
-
-    savePrefs();
-  }
-
-  function toggleTheme() {
-    applyTheme(state.theme === 'dark' ? 'light' : 'dark');
-  }
-
-  function route(path) {
+  function routeUrl(path) {
     return new URL(path, ORIGIN).href;
   }
 
-  function csrfFrom(doc = document) {
-    return (
-      doc.querySelector('meta[name="csrf-token"]')?.getAttribute('content') ||
-      doc.querySelector('input[name="_token"]')?.value ||
-      ''
-    );
+  function effectiveFormMethod(form) {
+    return String(
+      form.querySelector('[name="_method"]')?.value ||
+      form.getAttribute('method') ||
+      'GET'
+    ).toUpperCase();
+  }
+
+  function rawFormMethod(form) {
+    return String(form.getAttribute('method') || 'GET').toUpperCase();
   }
 
   function retryable(status) {
-    return [408, 425, 429, 500, 502, 503, 504].includes(Number(status));
+    return [408, 425, 429, 500, 502, 503, 504].includes(status);
   }
 
   function retryAfterMs(res) {
     const raw = res?.headers?.get('Retry-After');
     if (!raw) return 0;
-
     const sec = Number(raw);
     if (Number.isFinite(sec)) return Math.max(0, sec * 1000);
-
-    const dt = Date.parse(raw);
-    if (Number.isFinite(dt)) return Math.max(0, dt - Date.now());
-
-    return 0;
+    const t = Date.parse(raw);
+    return Number.isFinite(t) ? Math.max(0, t - Date.now()) : 0;
   }
 
-  async function fetchText(url, {
-    method = 'GET',
-    headers = {},
-    body = undefined,
-    attempts = CFG.getAttempts,
-    label = method,
-  } = {}) {
-    let lastErr;
+  async function fetchGet(url, label = 'GET') {
+    let last = null;
 
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      if (state.cancelled) throw new Error('Đã hủy.');
-
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), CFG.timeoutMs);
+    for (let attempt = 1; attempt <= CFG.getAttempts; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), CFG.getTimeoutMs);
 
       try {
         const res = await fetch(url, {
-          method,
+          method: 'GET',
           credentials: 'same-origin',
-          cache: method === 'GET' ? 'no-store' : 'default',
+          cache: 'no-store',
           redirect: 'follow',
-          headers,
-          body,
-          signal: ctrl.signal,
+          headers: {
+            Accept: 'text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5',
+          },
+          signal: controller.signal,
         });
-
-        const raw = await res.text();
-
-        if (!res.ok) {
-          const err = new Error(`${label}: HTTP ${res.status}`);
-          err.status = res.status;
-          err.responseText = raw;
-
-          if (retryable(res.status) && attempt < attempts) {
-            const wait = Math.max(
-              retryAfterMs(res),
-              CFG.retryBaseMs * attempt
-            );
-            addLog(`${label}: HTTP ${res.status}, retry ${attempt}/${attempts} sau ${wait}ms`, 'warn');
-            await sleep(wait);
-            continue;
-          }
-
-          throw err;
-        }
-
-        return { res, raw, finalUrl: res.url };
-      } catch (err) {
-        lastErr = err;
-
-        if (
-          attempt < attempts &&
-          (err?.name === 'AbortError' || !err?.status || retryable(err.status))
-        ) {
-          const wait = CFG.retryBaseMs * attempt;
-          addLog(`${label}: retry ${attempt}/${attempts} sau lỗi ${err.message}`, 'warn');
-          await sleep(wait);
-          continue;
-        }
-
-        throw err;
-      } finally {
         clearTimeout(timer);
+
+        if (res.ok || !retryable(res.status) || attempt === CFG.getAttempts) {
+          return res;
+        }
+
+        const wait = Math.max(
+          retryAfterMs(res),
+          CFG.retryBaseMs * (2 ** (attempt - 1)) + jitter(450)
+        );
+        addLog(`${label}: HTTP ${res.status}; retry ${attempt + 1}/${CFG.getAttempts} sau ${Math.ceil(wait / 1000)}s`, 'warn');
+        try { await res.body?.cancel(); } catch {}
+        await sleep(wait);
+      } catch (err) {
+        clearTimeout(timer);
+        last = err;
+        if (attempt === CFG.getAttempts) break;
+        const wait = CFG.retryBaseMs * (2 ** (attempt - 1)) + jitter(450);
+        addLog(`${label}: ${err?.message || err}; retry ${attempt + 1}/${CFG.getAttempts}`, 'warn');
+        await sleep(wait);
       }
     }
 
-    throw lastErr || new Error(`${label}: lỗi không xác định.`);
+    throw new Error(`${label}: ${last?.message || 'GET thất bại'}`);
   }
 
-  async function getJson(url, label = 'GET JSON') {
-    const { raw, res } = await fetchText(url, {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        'Cache-Control': 'no-cache',
-      },
-      label,
-    });
+  async function hiddenNavigateHtml(url, timeoutMs = 18000) {
+    return await new Promise((resolve, reject) => {
+      const frame = document.createElement('iframe');
+      frame.setAttribute('aria-hidden', 'true');
+      frame.style.cssText = 'position:fixed;left:-20000px;top:-20000px;width:2px;height:2px;opacity:0;pointer-events:none;border:0';
+      let done = false;
 
-    let data;
+      const finish = (fn, value) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { frame.remove(); } catch {}
+        fn(value);
+      };
+
+      const timer = setTimeout(
+        () => finish(reject, new Error('Navigation fallback timeout')),
+        timeoutMs
+      );
+
+      frame.onload = () => {
+        try {
+          if (!frame.contentWindow || !frame.contentDocument) return;
+          const href = frame.contentWindow.location.href;
+          if (!href || href === 'about:blank') return;
+          if (!href.startsWith(ORIGIN)) {
+            return finish(reject, new Error(`Redirect ngoài domain: ${href}`));
+          }
+          const html = frame.contentDocument.documentElement?.outerHTML || '';
+          if (!html) return finish(reject, new Error('Navigation fallback không đọc được HTML'));
+          finish(resolve, { html, finalUrl: href });
+        } catch (err) {
+          finish(reject, err);
+        }
+      };
+
+      frame.onerror = () => finish(reject, new Error('Navigation fallback frame error'));
+      frame.src = url;
+      document.documentElement.appendChild(frame);
+    });
+  }
+
+  async function fetchHtml(url, label = 'GET page') {
     try {
-      data = JSON.parse(raw);
-    } catch {
-      throw new Error(`${label}: server không trả JSON hợp lệ (HTTP ${res.status}).`);
+      const res = await fetchGet(url, label);
+      if (!res.ok) throw new Error(`${label}: HTTP ${res.status}`);
+      const finalUrl = res.url || url;
+      if (!finalUrl.startsWith(ORIGIN)) {
+        throw new Error(`${label}: phiên đăng nhập có thể đã hết`);
+      }
+      return {
+        html: await res.text(),
+        finalUrl,
+        status: res.status,
+        via: 'fetch',
+      };
+    } catch (err) {
+      addLog(`${label}: fetch không đọc được (${err.message}); thử navigation fallback...`, 'warn');
+      const nav = await hiddenNavigateHtml(url);
+      return { ...nav, status: 200, via: 'iframe' };
     }
-    return data;
   }
 
-  async function getDoc(url, label = 'GET page') {
-    const { raw, finalUrl } = await fetchText(url, {
-      method: 'GET',
-      headers: {
-        Accept: 'text/html,application/xhtml+xml',
-        'Cache-Control': 'no-cache',
-      },
-      label,
-    });
-
+  async function fetchDoc(url, label = 'GET page') {
+    const result = await fetchHtml(url, label);
     return {
-      html: raw,
-      finalUrl,
-      doc: new DOMParser().parseFromString(raw, 'text/html'),
+      ...result,
+      doc: new DOMParser().parseFromString(result.html, 'text/html'),
     };
   }
 
-  async function postForm(url, formData, label = 'POST form', { attempts = 2 } = {}) {
-    const token = csrfFrom();
-    if (!token) throw new Error('Không lấy được CSRF token hiện tại.');
+  async function postOnce(url, { body, headers = {}, label = 'POST', rawMethod = 'POST' } = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CFG.getTimeoutMs);
 
-    const { raw, res } = await fetchText(url, {
-      method: 'POST',
-      headers: {
-        'X-CSRF-TOKEN': token,
-        Accept: 'application/json',
-        'X-Requested-With': 'XMLHttpRequest',
-      },
-      body: formData,
-      attempts,
-      label,
-    });
-
-    let data;
     try {
-      data = JSON.parse(raw);
-    } catch {
-      throw new Error(`${label}: server trả dữ liệu không phải JSON.`);
+      const res = await fetch(url, {
+        method: rawMethod,
+        credentials: 'same-origin',
+        cache: 'no-store',
+        redirect: 'follow',
+        headers: {
+          Accept: 'text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5',
+          ...headers,
+        },
+        body,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error(`${label}: HTTP ${res.status}`);
+      return res;
+    } catch (err) {
+      clearTimeout(timer);
+      throw err;
     }
-
-    if (!res.ok || data?.success === false) {
-      throw new Error(data?.message || `${label}: thất bại.`);
-    }
-
-    return data;
   }
 
-  async function postJson(url, payload, label = 'POST JSON') {
-    const token = csrfFrom();
-    if (!token) throw new Error('Không lấy được CSRF token hiện tại.');
+  // ==========================================================
+  // LIVE FORM ADAPTER
+  // ==========================================================
 
-    const { raw, res } = await fetchText(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-CSRF-TOKEN': token,
-        Accept: 'application/json',
-        'X-Requested-With': 'XMLHttpRequest',
-      },
-      body: JSON.stringify(payload),
-      attempts: 2,
-      label,
-    });
+  function controlLabel(el, form) {
+    if (!el) return '';
 
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      throw new Error(`${label}: server trả dữ liệu không phải JSON.`);
+    const id = el.id;
+    if (id) {
+      const direct = form.querySelector(`label[for="${CSS.escape(id)}"]`);
+      if (direct) return text(direct.textContent);
     }
 
-    if (!res.ok || data?.success === false) {
-      let msg = data?.message || `${label}: thất bại.`;
-      if (data?.errors) {
-        const first = Object.values(data.errors).flat()[0];
-        if (first) msg += ` (${first})`;
-      }
-      throw new Error(msg);
+    const parentLabel = el.closest('label');
+    if (parentLabel) {
+      const clone = parentLabel.cloneNode(true);
+      clone.querySelectorAll('input,select,textarea,button').forEach(x => x.remove());
+      const t = text(clone.textContent);
+      if (t) return t;
     }
 
-    return data;
+    const group = el.closest('.form-group,.mb-3,.mb-2,.row,.col-md-6,.col-md-12');
+    if (group) {
+      const lab = group.querySelector('label,.col-form-label,.control-label,strong');
+      const t = text(lab?.textContent);
+      if (t) return t;
+    }
+
+    return el.getAttribute('placeholder') || el.name || el.id || '';
   }
 
-  // ============================================================
-  // STORIES
-  // ============================================================
-
-  function discoverStoryIds(doc, html) {
-    const ids = new Set();
-
-    for (const a of doc.querySelectorAll('a[href]')) {
-      const href = a.getAttribute('href') || '';
-      const m = href.match(/\/profile\/stories\/(\d+)\/import-word(?:$|\?)/);
-      if (m) ids.add(Number(m[1]));
-    }
-
-    const re = /\/profile\/stories\/(\d+)(?:\/|["'?#<\s])/g;
-    let m;
-    while ((m = re.exec(html))) {
-      ids.add(Number(m[1]));
-    }
-
-    // Alpine openManageChaptersModal({ "id": ... })
-    for (const el of doc.querySelectorAll('[\\@click], [x-on\\:click]')) {
-      const raw =
-        el.getAttribute('@click') ||
-        el.getAttribute('x-on:click') ||
-        '';
-      if (!/openManageChaptersModal|openEditStory/.test(raw)) continue;
-
-      const idMatch = raw.match(/["']?id["']?\s*:\s*(\d+)/);
-      if (idMatch) ids.add(Number(idMatch[1]));
-    }
-
-    return [...ids].filter(Number.isFinite).sort((a, b) => a - b);
+  function optionModel(opt) {
+    return {
+      value: opt.value,
+      text: text(opt.textContent),
+      selected: opt.selected,
+      disabled: opt.disabled,
+    };
   }
 
-  async function loadStories() {
-    setStatus('Đang tải danh sách truyện...');
-    const { doc, html } = await getDoc(route('/profile'), 'GET /profile');
-    const ids = discoverStoryIds(doc, html);
+  function formToModel(form, pageUrl = location.href) {
+    const fields = [];
 
-    if (!ids.length) {
-      state.stories.clear();
-      renderStories();
-      setStatus('Không tìm thấy truyện nào.', 'warn');
-      return;
+    for (const el of form.elements) {
+      const tag = String(el.tagName || '').toLowerCase();
+      const type = String(el.type || tag).toLowerCase();
+      const name = el.name || '';
+
+      if (['submit', 'button', 'reset', 'image'].includes(type)) continue;
+      if (!name) continue;
+
+      fields.push({
+        tag,
+        type,
+        name,
+        id: el.id || '',
+        label: controlLabel(el, form),
+        value: type === 'file' ? '' : (el.value ?? ''),
+        checked: !!el.checked,
+        required: !!el.required,
+        disabled: !!el.disabled,
+        readonly: !!el.readOnly,
+        multiple: !!el.multiple,
+        accept: el.getAttribute('accept') || '',
+        min: el.getAttribute('min') || '',
+        max: el.getAttribute('max') || '',
+        step: el.getAttribute('step') || '',
+        placeholder: el.getAttribute('placeholder') || '',
+        options: tag === 'select' ? [...el.options].map(optionModel) : [],
+      });
     }
 
-    const stories = new Map();
+    return {
+      pageUrl,
+      action: new URL(form.getAttribute('action') || pageUrl, pageUrl).href,
+      rawMethod: rawFormMethod(form),
+      effectiveMethod: effectiveFormMethod(form),
+      enctype: form.getAttribute('enctype') || 'application/x-www-form-urlencoded',
+      fields,
+    };
+  }
 
-    // GET chapters trả luôn story object, dùng làm nguồn canonical cho list.
-    for (const id of ids) {
-      if (state.cancelled) throw new Error('Đã hủy.');
+  function modelField(model, name) {
+    return model?.fields?.find(f => f.name === name) || null;
+  }
 
-      try {
-        const data = await getJson(
-          route(`/profile/stories/${id}/chapters`),
-          `GET chapters #${id}`
-        );
+  function modelValue(model, name) {
+    const f = modelField(model, name);
+    if (!f) return '';
+    if (f.type === 'checkbox' || f.type === 'radio') return f.checked ? f.value : '';
+    return f.value ?? '';
+  }
 
-        if (data?.story) {
-          stories.set(Number(id), {
-            ...data.story,
-            id: Number(data.story.id || id),
-            chapters_count:
-              Number(data.story.chapters_count ?? data.chapters?.length ?? 0),
-          });
-        } else {
-          stories.set(Number(id), {
-            id: Number(id),
-            title: `Truyện #${id}`,
-            chapters_count: Number(data?.chapters?.length || 0),
-          });
+  function modelToPairs(model) {
+    const pairs = [];
+
+    for (const f of model.fields) {
+      if (f.disabled || f.type === 'file') continue;
+      if ((f.type === 'checkbox' || f.type === 'radio') && !f.checked) continue;
+
+      if (f.tag === 'select' && f.multiple) {
+        for (const o of f.options.filter(x => x.selected)) {
+          pairs.push([f.name, o.value]);
         }
-      } catch (err) {
-        addLog(`Không đọc được metadata truyện #${id}: ${err.message}`, 'warn');
-        stories.set(Number(id), {
-          id: Number(id),
-          title: `Truyện #${id}`,
-          chapters_count: 0,
-          load_error: err.message,
-        });
+      } else {
+        pairs.push([f.name, f.value ?? '']);
+      }
+    }
+
+    return pairs;
+  }
+
+  function modelToParams(model, overrides = {}) {
+    const p = new URLSearchParams();
+    for (const [k, v] of modelToPairs(model)) p.append(k, v);
+
+    for (const [k, v] of Object.entries(overrides)) {
+      p.delete(k);
+      if (Array.isArray(v)) {
+        for (const x of v) p.append(k, String(x ?? ''));
+      } else if (v !== undefined && v !== null) {
+        p.set(k, String(v));
+      }
+    }
+
+    return p;
+  }
+
+  function inputKey(name, index) {
+    return `ttlcc-f-${name.replace(/[^a-z0-9_-]/gi, '_')}-${index}`;
+  }
+
+  function renderLiveForm(container, model, { title = '', submitText = 'Lưu', onSubmit = null } = {}) {
+    container.innerHTML = '';
+
+    if (title) {
+      const h = document.createElement('div');
+      h.className = 'ttlcc-form-title';
+      h.textContent = title;
+      container.appendChild(h);
+    }
+
+    const form = document.createElement('form');
+    form.className = 'ttlcc-live-form';
+    form.dataset.action = model.action;
+    form.dataset.rawMethod = model.rawMethod;
+    form.dataset.effectiveMethod = model.effectiveMethod;
+    form.dataset.enctype = model.enctype;
+
+    const hidden = [];
+    const groups = new Map();
+
+    model.fields.forEach((f, index) => {
+      if (f.type === 'hidden') {
+        hidden.push({ f, index });
+        return;
+      }
+      if (['checkbox', 'radio'].includes(f.type)) {
+        const key = `${f.type}:${f.name}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push({ f, index });
+        return;
+      }
+      groups.set(`single:${index}`, [{ f, index }]);
+    });
+
+    for (const { f, index } of hidden) {
+      const i = document.createElement('input');
+      i.type = 'hidden';
+      i.name = f.name;
+      i.value = f.value ?? '';
+      i.disabled = f.disabled;
+      form.appendChild(i);
+    }
+
+    for (const [key, entries] of groups) {
+      const wrap = document.createElement('div');
+      const multiCheck = key.startsWith('checkbox:') && entries.length > 1;
+      const multiRadio = key.startsWith('radio:') && entries.length > 1;
+      wrap.className = multiCheck || multiRadio ? 'ttlcc-field ttlcc-field-wide' : 'ttlcc-field';
+
+      if (multiCheck || multiRadio) {
+        const label = document.createElement('div');
+        label.className = 'ttlcc-label';
+        label.textContent = entries[0].f.name === 'category[]'
+          ? 'Thể loại'
+          : (entries[0].f.label || entries[0].f.name);
+        wrap.appendChild(label);
+
+        const grid = document.createElement('div');
+        grid.className = 'ttlcc-choice-grid';
+
+        for (const { f, index } of entries) {
+          const l = document.createElement('label');
+          l.className = 'ttlcc-choice';
+          const i = document.createElement('input');
+          i.type = f.type;
+          i.name = f.name;
+          i.value = f.value ?? '';
+          i.checked = f.checked;
+          i.disabled = f.disabled;
+          i.id = inputKey(f.name, index);
+          l.append(i, document.createTextNode(f.label || f.value || f.name));
+          grid.appendChild(l);
+        }
+        wrap.appendChild(grid);
+        form.appendChild(wrap);
+        continue;
       }
 
-      await sleep(120);
+      const { f, index } = entries[0];
+      const label = document.createElement('label');
+      label.className = 'ttlcc-label';
+      label.htmlFor = inputKey(f.name, index);
+      label.textContent = f.label || f.name;
+      wrap.appendChild(label);
+
+      let el;
+      if (f.tag === 'textarea') {
+        el = document.createElement('textarea');
+        el.value = f.value ?? '';
+        if (['content_chapter', 'mota', 'description'].includes(f.name)) {
+          wrap.classList.add('ttlcc-field-wide');
+          el.rows = f.name === 'content_chapter' ? 16 : 8;
+          el.classList.add('ttlcc-code-area');
+        }
+      } else if (f.tag === 'select') {
+        el = document.createElement('select');
+        el.multiple = f.multiple;
+        for (const o of f.options) {
+          const opt = document.createElement('option');
+          opt.value = o.value;
+          opt.textContent = o.text;
+          opt.selected = o.selected;
+          opt.disabled = o.disabled;
+          el.appendChild(opt);
+        }
+      } else {
+        el = document.createElement('input');
+        el.type = f.type || 'text';
+        if (f.type !== 'file') el.value = f.value ?? '';
+        if (f.accept) el.accept = f.accept;
+        if (f.min) el.min = f.min;
+        if (f.max) el.max = f.max;
+        if (f.step) el.step = f.step;
+      }
+
+      el.id = inputKey(f.name, index);
+      el.name = f.name;
+      el.required = f.required;
+      el.disabled = f.disabled;
+      el.readOnly = f.readonly;
+      if (f.placeholder) el.placeholder = f.placeholder;
+      wrap.appendChild(el);
+      form.appendChild(wrap);
     }
 
-    state.stories = stories;
+    const actions = document.createElement('div');
+    actions.className = 'ttlcc-form-actions ttlcc-field-wide';
+    const submit = document.createElement('button');
+    submit.type = 'submit';
+    submit.className = 'ttlcc-btn ttlcc-btn-primary';
+    submit.textContent = submitText;
+    actions.appendChild(submit);
+    form.appendChild(actions);
 
-    if (
-      state.selectedStoryId &&
-      state.stories.has(Number(state.selectedStoryId))
-    ) {
-      state.selectedStory = state.stories.get(Number(state.selectedStoryId));
-    } else {
-      const first = [...state.stories.values()][0] || null;
-      state.selectedStoryId = first?.id || null;
-      state.selectedStory = first;
+    if (onSubmit) {
+      form.addEventListener('submit', async e => {
+        e.preventDefault();
+        await onSubmit(form, model, submit);
+      });
     }
 
-    renderStories();
-    renderSelectedStory();
-    savePrefs();
-
-    setStatus(`Đã tải ${state.stories.size} truyện.`);
-    addLog(`Đã tải ${state.stories.size} truyện.`);
+    container.appendChild(form);
+    return form;
   }
 
-  async function selectStory(id, { load = true } = {}) {
-    id = Number(id);
-    if (!state.stories.has(id)) return;
+  function panelFormToPayload(form, model) {
+    const hasFile = $$('input[type="file"]', form).some(i => i.files?.length);
+    const useMultipart = /multipart\/form-data/i.test(model.enctype) || hasFile;
 
-    state.selectedStoryId = id;
-    state.selectedStory = state.stories.get(id);
-    state.chapters = [];
-    state.chapterMap.clear();
-    // state.stats là tổng hợp toàn bộ truyện, không reset khi đổi truyện.
-    state.bulk.parsed = [];
-
-    renderStories();
-    renderSelectedStory();
-    renderChapters();
-    renderBulkPreview();
-    renderStats();
-    savePrefs();
-
-    if (load) {
-      await loadChapters();
+    if (useMultipart) {
+      return {
+        body: new FormData(form),
+        headers: {},
+      };
     }
+
+    const fd = new FormData(form);
+    const p = new URLSearchParams();
+    for (const [k, v] of fd.entries()) {
+      if (typeof File !== 'undefined' && v instanceof File) continue;
+      p.append(k, String(v));
+    }
+    return {
+      body: p.toString(),
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+    };
   }
 
-  function renderStories() {
-    const host = $('#ytlcc-story-list');
-    if (!host) return;
+  async function submitRenderedForm(form, model, label) {
+    const payload = panelFormToPayload(form, model);
 
-    const stories = [...state.stories.values()];
-
-    if (!stories.length) {
-      host.innerHTML = '<div class="ytlcc-empty">Chưa có dữ liệu truyện.</div>';
-      return;
+    if (model.rawMethod === 'GET') {
+      const p = payload.body instanceof FormData
+        ? new URLSearchParams([...payload.body.entries()].map(([k, v]) => [k, String(v)]))
+        : new URLSearchParams(payload.body);
+      const url = new URL(model.action);
+      for (const [k, v] of p.entries()) url.searchParams.append(k, v);
+      return fetchGet(url.href, label);
     }
 
-    host.innerHTML = stories.map(story => {
-      const active = Number(story.id) === Number(state.selectedStoryId);
-      return `
-        <button type="button"
-          class="ytlcc-story-row ${active ? 'active' : ''}"
-          data-story-id="${story.id}">
-          <div class="ytlcc-story-main">
-            <strong>${esc(story.title || `Truyện #${story.id}`)}</strong>
-            <span>#${story.id} · ${Number(story.chapters_count || 0)} chương · ${esc(story.status || '')}</span>
-          </div>
-        </button>
-      `;
-    }).join('');
+    return postOnce(model.action, {
+      ...payload,
+      rawMethod: model.rawMethod || 'POST',
+      label,
+    });
+  }
 
-    for (const btn of host.querySelectorAll('[data-story-id]')) {
-      btn.addEventListener('click', () => {
-        selectStory(Number(btn.dataset.storyId)).catch(err => {
-          toast(err.message, 'error', 5000);
+  // ==========================================================
+  // STORY DISCOVERY / MANAGEMENT
+  // ==========================================================
+
+  function nearestStoryContainer(el) {
+    return el.closest('tr,.card,.list-group-item,.media,.row,li,.post,.item') || el.parentElement;
+  }
+
+  function candidateStoryTitle(container, id) {
+    if (!container) return '';
+
+    const preferred = [
+      '[class*="title"]',
+      '[class*="name"]',
+      'h2', 'h3', 'h4', 'strong',
+    ];
+
+    for (const sel of preferred) {
+      for (const el of container.querySelectorAll(sel)) {
+        const t = text(el.textContent);
+        if (
+          t &&
+          t.length >= 2 &&
+          t.length <= 180 &&
+          !/^(sửa|xóa|chương mới|danh sách chương|đang hiển thị|tạm ẩn)$/i.test(t)
+        ) {
+          return t;
+        }
+      }
+    }
+
+    const all = text(container.textContent);
+    if (all && all.length <= 180) return all;
+    return '';
+  }
+
+  function parsePublishForm(form, pageUrl) {
+    const action = new URL(form.getAttribute('action') || '', pageUrl);
+    const m = action.pathname.match(/^\/publishtruyen\/(\d+)\/?$/);
+    if (!m) return null;
+
+    const model = formToModel(form, pageUrl);
+    const button = form.querySelector('button[type="submit"],input[type="submit"]');
+    return {
+      storyId: Number(m[1]),
+      model,
+      label: text(button?.textContent || button?.value || 'Đổi trạng thái'),
+      title: button?.getAttribute('title') || '',
+      kichhoat: modelValue(model, 'kichhoat'),
+    };
+  }
+
+  function parseStoriesFromDoc(doc, pageUrl) {
+    const map = new Map();
+
+    function ensure(id) {
+      id = Number(id);
+      if (!Number.isInteger(id) || id <= 0) return null;
+      if (!map.has(id)) {
+        map.set(id, {
+          id,
+          title: '',
+          editUrl: routeUrl(`/truyen/${id}/edit`),
+          chapterUrl: routeUrl(`/chapter/${id}`),
+          createChapterUrl: routeUrl(`/createchapter/${id}`),
+          publish: null,
+          evidence: [],
         });
+      }
+      return map.get(id);
+    }
+
+    for (const form of doc.querySelectorAll('form[action]')) {
+      const pub = parsePublishForm(form, pageUrl);
+      if (!pub) continue;
+      const s = ensure(pub.storyId);
+      if (!s) continue;
+      s.publish = pub;
+      const container = nearestStoryContainer(form);
+      const title = candidateStoryTitle(container, s.id);
+      if (title && !s.title) s.title = title;
+      const confirmText = form.querySelector('[onclick*="confirm"]')?.getAttribute('onclick') || '';
+      const cm = confirmText.match(/truyện\s+(.+?)\s+(?:không|khong)\?/i);
+      if (cm?.[1]) s.title = text(cm[1]);
+      s.evidence.push('publish-form');
+    }
+
+    const selectors = [
+      ['a[href*="/truyen/"][href$="/edit"]', /\/truyen\/(\d+)\/edit(?:$|[?#])/],
+      ['a[href*="/chapter/"]', /\/chapter\/(\d+)(?:$|[?#])/],
+      ['a[href*="/createchapter/"]', /\/createchapter\/(\d+)(?:$|[?#])/],
+    ];
+
+    for (const [selector, regex] of selectors) {
+      for (const a of doc.querySelectorAll(selector)) {
+        let href = '';
+        try { href = new URL(a.getAttribute('href'), pageUrl).href; } catch { continue; }
+        const m = href.match(regex);
+        if (!m) continue;
+        const s = ensure(m[1]);
+        if (!s) continue;
+        const container = nearestStoryContainer(a);
+        const title = candidateStoryTitle(container, s.id);
+        if (title && (!s.title || s.title.startsWith('Truyện #'))) s.title = title;
+        s.evidence.push(selector);
+      }
+    }
+
+    for (const s of map.values()) {
+      if (!s.title) s.title = `Truyện #${s.id}`;
+    }
+
+    return map;
+  }
+
+  async function hydrateStoryTitles(map) {
+    const unknown = [...map.values()].filter(s => !s.title || s.title.startsWith('Truyện #'));
+    for (let i = 0; i < Math.min(unknown.length, 8); i++) {
+      const s = unknown[i];
+      try {
+        const { doc } = await fetchDoc(s.editUrl, `Đọc tên truyện #${s.id}`);
+        const f = [...doc.forms].find(x => x.querySelector('[name="tentruyen"]'));
+        const title = f?.querySelector('[name="tentruyen"]')?.value;
+        if (title) s.title = text(title);
+      } catch {}
+      if (i + 1 < unknown.length) await sleep(200);
+    }
+  }
+
+  function mergeStories(next) {
+    for (const [id, s] of next) {
+      const prev = state.stories.get(id);
+      state.stories.set(id, {
+        ...prev,
+        ...s,
+        title: s.title || prev?.title || `Truyện #${id}`,
+        publish: s.publish || prev?.publish || null,
       });
     }
   }
 
-  function renderSelectedStory() {
-    const title = $('#ytlcc-selected-title');
-    const sub = $('#ytlcc-selected-sub');
+  async function loadStories({ serverSearch = false, query = '' } = {}) {
+    setStatus(serverSearch ? 'Đang tìm truyện trên server…' : 'Đang tải danh sách truyện…');
 
-    if (!state.selectedStory) {
-      if (title) title.textContent = 'Chưa chọn truyện';
-      if (sub) sub.textContent = '';
-      const overviewStory = $('#ytlcc-overview-story');
-      const overviewChapters = $('#ytlcc-overview-chapters');
-      if (overviewStory) overviewStory.textContent = '—';
-      if (overviewChapters) overviewChapters.textContent = '—';
+    let doc;
+    let pageUrl = routeUrl('/truyen');
+
+    if (!serverSearch) {
+      const result = await fetchDoc(pageUrl, 'GET danh sách truyện');
+      doc = result.doc;
+      pageUrl = result.finalUrl;
+
+      const searchForm = [...doc.forms].find(f => {
+        const path = new URL(f.getAttribute('action') || '', pageUrl).pathname;
+        return path === '/truyen/search' && f.querySelector('[name="key_search"]');
+      });
+      if (searchForm) state.storySearchForm = formToModel(searchForm, pageUrl);
+    } else {
+      if (!state.storySearchForm) await loadStories();
+      const p = modelToParams(state.storySearchForm, {
+        key_search: query,
+        date_start: '',
+        date_end: '',
+      });
+      const res = await postOnce(state.storySearchForm.action, {
+        body: p.toString(),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+        rawMethod: state.storySearchForm.rawMethod || 'POST',
+        label: 'POST tìm truyện',
+      });
+      pageUrl = res.url || state.storySearchForm.action;
+      doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+    }
+
+    const found = parseStoriesFromDoc(doc, pageUrl);
+    await hydrateStoryTitles(found);
+
+    if (!serverSearch) state.stories.clear();
+    mergeStories(found);
+
+    renderStoryList();
+    setStatus(`Đã nhận ${state.stories.size} truyện.`, 'ok');
+
+    if (!state.selectedStoryId || !state.stories.has(Number(state.selectedStoryId))) {
+      const remembered = Number(loadPrefs().selectedStoryId || 0);
+      const first = state.stories.get(remembered) || [...state.stories.values()][0] || null;
+      if (first) await selectStory(first.id, { loadChaptersNow: true });
+    } else {
+      state.selectedStory = state.stories.get(Number(state.selectedStoryId));
+      renderStoryHeader();
+    }
+
+    return found;
+  }
+
+  function renderStoryList() {
+    const body = $('#ttlcc-story-list');
+    if (!body) return;
+    body.innerHTML = '';
+
+    const filter = norm($('#ttlcc-story-filter')?.value || '');
+    const rows = [...state.stories.values()]
+      .filter(s => !filter || norm(`${s.title} ${s.id}`).includes(filter))
+      .sort((a, b) => a.id - b.id);
+
+    if (!rows.length) {
+      body.innerHTML = '<div class="ttlcc-empty">Không có truyện phù hợp.</div>';
       return;
     }
 
-    if (title) title.textContent = state.selectedStory.title || `Truyện #${state.selectedStoryId}`;
-    if (sub) {
-      sub.textContent =
-        `#${state.selectedStoryId}` +
-        (state.selectedStory.status ? ` · ${state.selectedStory.status}` : '') +
-        (state.selectedStory.type ? ` · ${state.selectedStory.type}` : '');
+    for (const story of rows) {
+      const el = document.createElement('button');
+      el.type = 'button';
+      el.className = `ttlcc-story-item ${Number(state.selectedStoryId) === story.id ? 'active' : ''}`;
+      el.innerHTML = `
+        <span class="ttlcc-story-title">${esc(story.title)}</span>
+        <span class="ttlcc-story-id">#${story.id}</span>
+      `;
+      el.onclick = () => selectStory(story.id, { loadChaptersNow: true });
+      body.appendChild(el);
+    }
+  }
+
+  function resetBulkForStoryChange() {
+    state.bulk.parsed = [];
+    state.bulk.pricing.clear();
+    state.bulk.existingPricing.clear();
+    state.snapshotCache.clear();
+
+    const txt = $('#ttlcc-bulk-text');
+    if (txt) txt.value = '';
+
+    const file = $('#ttlcc-bulk-file');
+    if (file) file.value = '';
+
+    for (const id of [
+      '#ttlcc-bulk-from',
+      '#ttlcc-bulk-to',
+      '#ttlcc-price-from',
+      '#ttlcc-price-to',
+    ]) {
+      const el = $(id);
+      if (el) el.value = '';
     }
 
-    const overviewStory = $('#ytlcc-overview-story');
-    const overviewChapters = $('#ytlcc-overview-chapters');
-    if (overviewStory) overviewStory.textContent = state.selectedStory.title || `#${state.selectedStoryId}`;
-    if (overviewChapters) overviewChapters.textContent = `${Number(state.selectedStory.chapters_count || state.chapters.length || 0)} chương`;
+    renderBulkPreview();
   }
 
-  function safeFileName(raw) {
-    return String(raw || 'truyen')
-      .replace(/[\\/:*?"<>|]+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 120) || 'truyen';
+  async function selectStory(id, { loadChaptersNow = false } = {}) {
+    id = Number(id);
+
+    const previousStoryId = Number(state.selectedStoryId || 0);
+
+    if (previousStoryId && previousStoryId !== id) {
+      resetBulkForStoryChange();
+
+      // Không để bảng/chỉ số/chapter template của truyện cũ tồn tại
+      // trong lúc truyện mới đang được tải.
+      state.chapters = [];
+      state.chapterMap.clear();
+      state.chapterHeaderMap = {};
+      state.chapterCreateModel = null;
+      state.storyEditorModel = null;
+
+      addLog(
+        `Đổi truyện #${previousStoryId} → #${id}: đã xóa dữ liệu chương/TXT/target Bulk cũ để tránh thao tác nhầm truyện.`,
+        'warn'
+      );
+    }
+
+    const story = state.stories.get(id) || {
+      id,
+      title: `Truyện #${id}`,
+      editUrl: routeUrl(`/truyen/${id}/edit`),
+      chapterUrl: routeUrl(`/chapter/${id}`),
+      createChapterUrl: routeUrl(`/createchapter/${id}`),
+      publish: null,
+    };
+
+    state.selectedStoryId = id;
+    state.selectedStory = story;
+    state.snapshotCache.clear();
+    renderStoryList();
+    renderStoryHeader();
+    savePrefs();
+
+    if (loadChaptersNow) {
+      try { await loadChapters(id); } catch (err) { toast(`Không tải được chương: ${err.message}`, 'error', 5000); }
+    }
   }
 
-  function buildStoryTxt(chapters) {
-    const sorted = [...chapters].sort(
-      (a, b) => Number(a.chapter_number) - Number(b.chapter_number)
-    );
+  function renderStoryHeader() {
+    const story = state.selectedStory;
+    const title = $('#ttlcc-selected-title');
+    const sub = $('#ttlcc-selected-sub');
+    if (title) title.textContent = story ? story.title : 'Chưa chọn truyện';
+    if (sub) sub.textContent = story ? `ID ${story.id}` : 'Hãy chọn truyện từ danh sách';
 
-    return sorted.map(ch => {
-      const no = Number(ch.chapter_number);
-      const title = String(ch.title || '').trim();
-      const heading = title
-        ? `Chương ${no}: ${title}`
-        : `Chương ${no}`;
+    const badge = $('#ttlcc-story-badge');
+    if (badge) badge.textContent = story ? `#${story.id}` : '—';
 
-      const body = htmlToPlain(ch.content || '').trim();
-
-      return `${heading}\n\n${body}`.trim();
-    }).join('\n\n\n');
+    renderDashboard();
   }
 
-  async function downloadStoryTxt() {
+  async function loadStoryEditor() {
+    const host = $('#ttlcc-story-editor');
+    if (!host) return;
+
     if (!state.selectedStoryId) {
-      throw new Error('Chưa chọn truyện.');
+      return toast('Chưa chọn truyện.', 'warn');
     }
 
-    setStatus('Đang lấy nội dung mới nhất...');
+    host.innerHTML =
+      '<div class="ttlcc-loading">Đang đọc form thật từ server…</div>';
 
-    const snap = await fetchChapterSnapshot(state.selectedStoryId);
-    const chapters = (snap.chapters || [])
-      .sort((a, b) => Number(a.chapter_number) - Number(b.chapter_number));
+    const url =
+      routeUrl(`/truyen/${state.selectedStoryId}/edit`);
 
-    if (!chapters.length) {
-      throw new Error('Truyện chưa có chương để tải.');
+    try {
+      const { doc, finalUrl } =
+        await fetchDoc(
+          url,
+          'GET form sửa truyện'
+        );
+
+      const form =
+        [...doc.forms].find(f => {
+          const action =
+            new URL(
+              f.getAttribute('action') || '',
+              finalUrl
+            ).pathname;
+
+          return (
+            f.querySelector('[name="tentruyen"]') &&
+            /^\/truyen\/\d+$/.test(action)
+          );
+        });
+
+      if (!form) {
+        throw new Error(
+          'Không tìm thấy form sửa truyện có field tentruyen.'
+        );
+      }
+
+      const model =
+        formToModel(form, finalUrl);
+
+      state.storyEditorModel = model;
+
+      renderLiveForm(host, model, {
+        title:
+          `Sửa truyện #${state.selectedStoryId}`,
+        submitText: 'Lưu thay đổi',
+
+        onSubmit:
+          async (
+            uiForm,
+            liveModel,
+            btn
+          ) => {
+            const action =
+              `LƯU TRUYỆN #${state.selectedStoryId}`;
+
+            if (
+              !confirm(
+                `${action}\n\n` +
+                'Script sẽ gửi đúng form vừa đọc từ server. Tiếp tục?'
+              )
+            ) {
+              return;
+            }
+
+            btn.disabled = true;
+
+            try {
+              await submitRenderedForm(
+                uiForm,
+                liveModel,
+                action
+              );
+
+              toast(
+                `${action}: server đã nhận yêu cầu. Đang re-check…`,
+                'ok'
+              );
+
+              await sleep(500);
+              await loadStories();
+              await loadStoryEditor();
+            } catch (err) {
+              toast(
+                `${action} lỗi: ${err.message}`,
+                'error',
+                6000
+              );
+            } finally {
+              btn.disabled = false;
+            }
+          },
+      });
+    } catch (err) {
+      host.innerHTML = `
+        <div class="ttlcc-error-box">
+          Không dựng được form tùy biến: ${esc(err.message)}
+          <button
+            class="ttlcc-btn ttlcc-btn-soft"
+            id="ttlcc-story-native-fallback"
+            type="button"
+          >
+            Mở form gốc trong Control Center
+          </button>
+        </div>`;
+
+      $('#ttlcc-story-native-fallback')
+        ?.addEventListener(
+          'click',
+          () =>
+            openNativeTool(
+              url,
+              'Form truyện gốc'
+            )
+        );
     }
-
-    state.chapters = chapters;
-    state.chapterMap = new Map(
-      chapters.map(ch => [Number(ch.chapter_number), ch])
-    );
-
-    if (snap.story) {
-      state.selectedStory = {
-        ...(state.stories.get(Number(state.selectedStoryId)) || {}),
-        ...snap.story,
-        chapters_count: chapters.length,
-      };
-      state.stories.set(Number(state.selectedStoryId), state.selectedStory);
-    }
-
-    renderStories();
-    renderSelectedStory();
-    renderChapters();
-
-    const txt = buildStoryTxt(chapters);
-    const firstNo = Number(chapters[0].chapter_number);
-    const lastNo = Number(chapters.at(-1).chapter_number);
-    const storyTitle =
-      state.selectedStory?.title ||
-      snap.story?.title ||
-      `Truyen-${state.selectedStoryId}`;
-
-    const filename =
-      `${safeFileName(storyTitle)} - Chương ${firstNo}-${lastNo}.txt`;
-
-    const blob = new Blob(
-      ['\uFEFF', txt],
-      { type: 'text/plain;charset=utf-8' }
-    );
-
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-
-    const msg = `Đã xuất ${chapters.length} chương: ${filename}`;
-    setStatus(msg, 'success');
-    toast(msg, 'success', 5000);
-    addLog(msg, 'success');
   }
 
-  // ============================================================
-  // CHAPTERS
-  // ============================================================
+  async function togglePublishSelected() {
+    if (!state.selectedStoryId) return toast('Chưa chọn truyện.', 'warn');
 
-  function normalizeChapter(ch) {
+    let story = state.stories.get(Number(state.selectedStoryId));
+    if (!story?.publish) {
+      await loadStories();
+      story = state.stories.get(Number(state.selectedStoryId));
+    }
+
+    if (!story?.publish) {
+      return toast('Không tìm thấy form publish/ẩn cho truyện này trên danh sách hiện tại.', 'warn', 5000);
+    }
+
+    const p = story.publish;
+    const msg = `${p.label || 'Đổi trạng thái'} — ${story.title}\n\n${p.title || 'Đây là thao tác thay đổi trạng thái thật trên server.'}`;
+    if (!confirm(msg)) return;
+
+    try {
+      const params = modelToParams(p.model);
+      await postOnce(p.model.action, {
+        rawMethod: p.model.rawMethod || 'POST',
+        body: params.toString(),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+        label: `Publish truyện #${story.id}`,
+      });
+      toast('Đã gửi thay đổi trạng thái. Đang tải lại danh sách…', 'ok');
+      await sleep(450);
+      await loadStories();
+    } catch (err) {
+      toast(`Đổi trạng thái lỗi: ${err.message}`, 'error', 6000);
+    }
+  }
+
+  // ==========================================================
+  // CHAPTER LIST / EDIT / CREATE / DELETE
+  // ==========================================================
+
+  function mapChapterHeaders(table) {
+    const map = {};
+    const headers = [...table.querySelectorAll('thead th')].map((th, index) => ({
+      index,
+      text: norm(th.textContent),
+    }));
+
+    function find(key, regex) {
+      const h = headers.find(x => regex.test(x.text));
+      if (h) map[key] = h.index;
+    }
+
+    find('no', /^(#|stt|so thu tu)$/);
+    find('title', /ten chuong/);
+    find('status', /trang thai/);
+    find('slug', /slug/);
+    find('words', /so tu/);
+    find('pass', /co pass|mat khau|pass/);
+    find('stars', /so sao|sao mo khoa/);
+    find('diamonds', /kim cuong|kc mo khoa/);
+    find('actions', /chuc nang|thao tac/);
+
+    return map;
+  }
+
+  function parseIntText(value) {
+    return Number(String(value || '').replace(/[^0-9.-]/g, '')) || 0;
+  }
+
+  function parseChapterList(doc, pageUrl, storyId) {
+    const table = doc.querySelector('#PhanTrang') || [...doc.querySelectorAll('table')].find(t => {
+      const hs = norm([...t.querySelectorAll('th')].map(x => x.textContent).join(' | '));
+      return hs.includes('ten chuong') && hs.includes('so tu');
+    });
+
+    if (!table) throw new Error('Không tìm thấy bảng chương.');
+
+    const hm = mapChapterHeaders(table);
+    if (hm.title === undefined || hm.words === undefined) {
+      throw new Error('Không map được header Tên chương/Số từ.');
+    }
+
+    const deletes = new Map();
+    for (const form of doc.querySelectorAll('form[action]')) {
+      const action = new URL(form.getAttribute('action'), pageUrl);
+      const m = action.pathname.match(/^\/chapter\/(\d+)\/?$/);
+      if (!m || effectiveFormMethod(form) !== 'DELETE') continue;
+      deletes.set(Number(m[1]), formToModel(form, pageUrl));
+    }
+
+    const rows = [];
+    let fallbackNo = 0;
+
+    for (const tr of table.querySelectorAll('tbody tr')) {
+      const cells = [...tr.querySelectorAll('td')];
+      if (!cells.length) continue;
+
+      const edit = tr.querySelector('a[href*="/chapter/"][href*="/edit"]');
+      const editHref = edit ? new URL(edit.getAttribute('href'), pageUrl).href : '';
+      const mid = editHref.match(/\/chapter\/(\d+)\/edit(?:$|[?#])/);
+      if (!mid) continue;
+      const chapterId = Number(mid[1]);
+
+      let no = hm.no !== undefined ? parseIntText(cells[hm.no]?.textContent) : 0;
+      if (!no) no = ++fallbackNo;
+      else fallbackNo = no;
+
+      const title = text(cells[hm.title]?.textContent);
+      const row = {
+        chapterNo: no,
+        chapterId,
+        storyId: Number(storyId),
+        title,
+        status: hm.status !== undefined ? text(cells[hm.status]?.textContent) : '',
+        slug: hm.slug !== undefined ? text(cells[hm.slug]?.textContent) : '',
+        wordCount: hm.words !== undefined ? parseIntText(cells[hm.words]?.textContent) : 0,
+        passLabel: hm.pass !== undefined ? text(cells[hm.pass]?.textContent) : '',
+        stars: hm.stars !== undefined ? parseIntText(cells[hm.stars]?.textContent) : 0,
+        diamonds: hm.diamonds !== undefined ? parseIntText(cells[hm.diamonds]?.textContent) : 0,
+        editUrl: editHref,
+        deleteModel: deletes.get(chapterId) || null,
+      };
+      rows.push(row);
+    }
+
     return {
-      ...ch,
-      id: Number(ch.id),
-      story_id: Number(ch.story_id || state.selectedStoryId),
-      chapter_number: Number(ch.chapter_number),
-      title: String(ch.title || ''),
-      content: String(ch.content || ''),
-      password: String(ch.password || ''),
-      stars_active: Number(ch.stars_active || 0),
-      diamonds_active: Number(ch.diamonds_active || 0),
-      word_count: Number(ch.word_count || 0),
-      views_count: Number(ch.views_count || 0),
-      status: String(ch.status || ''),
-      published_at: ch.published_at || '',
+      headerMap: hm,
+      rows: rows.sort((a, b) => a.chapterNo - b.chapterNo),
     };
   }
 
-  async function fetchChapterSnapshot(storyId = state.selectedStoryId) {
-    storyId = Number(storyId);
+  async function loadChapters(storyId = state.selectedStoryId) {
     if (!storyId) throw new Error('Chưa chọn truyện.');
+    if (state.chapterLoading) return;
 
-    const data = await getJson(
-      route(`/profile/stories/${storyId}/chapters`),
-      `GET chapters #${storyId}`
-    );
+    state.chapterLoading = true;
+    const listBody = $('#ttlcc-chapter-body');
+    if (listBody) listBody.innerHTML = '<tr><td colspan="10" class="ttlcc-loading">Đang tải danh sách chương…</td></tr>';
 
-    if (!data?.success && !Array.isArray(data?.chapters)) {
-      throw new Error('Response chapters không đúng schema dự kiến.');
+    try {
+      const url = routeUrl(`/chapter/${storyId}`);
+      const { doc, finalUrl } = await fetchDoc(url, `GET chương truyện #${storyId}`);
+      const parsed = parseChapterList(doc, finalUrl, storyId);
+
+      state.chapters = parsed.rows;
+      state.chapterMap = new Map(parsed.rows.map(r => [r.chapterNo, r]));
+      state.chapterHeaderMap = parsed.headerMap;
+      state.snapshotCache.clear();
+
+      initializeExistingPricing();
+      renderChapters();
+      renderDashboard();
+      renderBulkPreview();
+      setStatus(`Đã tải ${state.chapters.length} chương của truyện #${storyId}.`, 'ok');
+    } finally {
+      state.chapterLoading = false;
     }
-
-    return {
-      story: data.story || null,
-      chapters: (data.chapters || []).map(normalizeChapter),
-    };
-  }
-
-  async function loadChapters() {
-    if (!state.selectedStoryId) {
-      toast('Chưa chọn truyện.', 'warn');
-      return;
-    }
-
-    setStatus(`Đang tải chương #${state.selectedStoryId}...`);
-
-    const snap = await fetchChapterSnapshot();
-
-    state.chapters = snap.chapters
-      .sort((a, b) => Number(a.chapter_number) - Number(b.chapter_number));
-
-    state.chapterMap = new Map(
-      state.chapters.map(ch => [Number(ch.chapter_number), ch])
-    );
-
-    if (snap.story) {
-      state.selectedStory = {
-        ...(state.stories.get(Number(state.selectedStoryId)) || {}),
-        ...snap.story,
-        chapters_count: state.chapters.length,
-      };
-      state.stories.set(Number(state.selectedStoryId), state.selectedStory);
-    }
-
-    renderStories();
-    renderSelectedStory();
-    renderChapters();
-
-    setStatus(`Đã tải ${state.chapters.length} chương.`);
-    addLog(`Truyện #${state.selectedStoryId}: ${state.chapters.length} chương.`);
   }
 
   function renderChapters() {
-    const body = $('#ytlcc-chapter-body');
-    const count = $('#ytlcc-chapter-count');
-    if (count) count.textContent = String(state.chapters.length);
+    const body = $('#ttlcc-chapter-body');
     if (!body) return;
+    body.innerHTML = '';
 
-    if (!state.selectedStoryId) {
-      body.innerHTML = '<tr><td colspan="7" class="ytlcc-empty">Chưa chọn truyện.</td></tr>';
+    const q = norm($('#ttlcc-chapter-filter')?.value || '');
+    const onlyPaid = $('#ttlcc-chapter-paid')?.checked;
+    const onlyShort = $('#ttlcc-chapter-short')?.checked;
+
+    const rows = state.chapters.filter(r => {
+      if (q && !norm(`${r.chapterNo} ${r.title} ${r.slug} ${r.status}`).includes(q)) return false;
+      if (onlyPaid && !(r.stars > 0 || r.diamonds > 0)) return false;
+      if (onlyShort && !(r.wordCount > 0 && r.wordCount < CFG.pricing.minPaidWords)) return false;
+      return true;
+    });
+
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="10" class="ttlcc-empty">Không có chương phù hợp.</td></tr>';
       return;
     }
 
-    if (!state.chapters.length) {
-      body.innerHTML = '<tr><td colspan="7" class="ytlcc-empty">Chưa có chương hoặc chưa tải dữ liệu.</td></tr>';
-      return;
+    for (const r of rows) {
+      const price = r.diamonds > 0 ? `${r.diamonds} KC` : r.stars > 0 ? `${r.stars} sao` : 'FREE';
+      const shortPaid = r.wordCount > 0 && r.wordCount < CFG.pricing.minPaidWords && (r.stars > 0 || r.diamonds > 0);
+      const tr = document.createElement('tr');
+      if (shortPaid) tr.classList.add('ttlcc-row-warn');
+      tr.innerHTML = `
+        <td>${r.chapterNo}</td>
+        <td class="ttlcc-left">${esc(r.title)}</td>
+        <td>${esc(r.status || '—')}</td>
+        <td>${esc(r.slug || '—')}</td>
+        <td>${r.wordCount.toLocaleString()}</td>
+        <td>${esc(r.passLabel || '—')}</td>
+        <td>${esc(price)}${shortPaid ? '<div class="ttlcc-mini-warn">&lt;1000 từ nhưng đang trả phí</div>' : ''}</td>
+        <td class="ttlcc-row-actions">
+          <button type="button" class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" data-edit="${r.chapterNo}">Sửa</button>
+          <button type="button" class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-danger" data-delete="${r.chapterNo}" ${r.deleteModel ? '' : 'disabled'}>Xóa</button>
+        </td>
+      `;
+      body.appendChild(tr);
     }
 
-    body.innerHTML = state.chapters.map(ch => `
-      <tr>
-        <td>${esc(ch.chapter_number)}</td>
-        <td class="ytlcc-title-cell" title="${esc(ch.title)}">${esc(ch.title)}</td>
-        <td>${esc(ch.word_count)}</td>
-        <td>${esc(ch.views_count)}</td>
-        <td>${esc(ch.stars_active)}</td>
-        <td>${esc(ch.status)}</td>
-        <td><button type="button" class="ytlcc-mini" data-edit-ch="${ch.chapter_number}">Sửa</button></td>
-      </tr>
-    `).join('');
-
-    for (const btn of body.querySelectorAll('[data-edit-ch]')) {
-      btn.addEventListener('click', () => {
-        openSingleChapterEditor(Number(btn.dataset.editCh));
-      });
-    }
+    body.querySelectorAll('[data-edit]').forEach(btn => {
+      btn.onclick = () => openChapterEditor(Number(btn.dataset.edit));
+    });
+    body.querySelectorAll('[data-delete]').forEach(btn => {
+      btn.onclick = () => deleteChapter(Number(btn.dataset.delete));
+    });
   }
 
-  function currentPublishFields(ch) {
-    if (ch.status === 'scheduled' && ch.published_at) {
-      return {
-        publish_type: 'scheduled',
-        published_at: String(ch.published_at).replace(' ', 'T').substring(0, 16),
-      };
-    }
-
-    return {
-      publish_type: 'now',
-      published_at: '',
-    };
+  function findChapterForm(doc, mode = 'edit') {
+    return [...doc.forms].find(f => {
+      const hasCore = f.querySelector('[name="name_chapter"]') && f.querySelector('[name="content_chapter"]');
+      if (!hasCore) return false;
+      const action = new URL(f.getAttribute('action') || '', ORIGIN).pathname;
+      return mode === 'create' ? action === '/chapter' : /^\/chapter\/\d+$/.test(action);
+    }) || null;
   }
 
-  async function updateChapter(ch, overrides = {}, label = '') {
-    const publish = currentPublishFields(ch);
+  async function openChapterEditor(chapterNo) {
+    const row = state.chapterMap.get(Number(chapterNo));
+    if (!row) return toast(`Không map được chương ${chapterNo}.`, 'error');
 
-    const fd = new FormData();
-    fd.set('_token', csrfFrom());
-    fd.set('chapter_number', String(overrides.chapter_number ?? ch.chapter_number));
-    fd.set('title', String(overrides.title ?? ch.title ?? ''));
-    fd.set('content', String(overrides.content ?? ch.content ?? ''));
-    fd.set('password', String(overrides.password ?? ch.password ?? ''));
-    fd.set('stars_active', String(Number(overrides.stars_active ?? ch.stars_active ?? 0)));
-    fd.set('publish_type', String(overrides.publish_type ?? publish.publish_type));
-    fd.set('published_at', String(overrides.published_at ?? publish.published_at));
-
-    return postForm(
-      route(`/profile/stories/${state.selectedStoryId}/chapters/${ch.id}/update`),
-      fd,
-      label || `UPDATE chương ${ch.chapter_number}`
-    );
-  }
-
-  function openSingleChapterEditor(chapterNo) {
-    const ch = state.chapterMap.get(Number(chapterNo));
-    if (!ch) return;
-
-    const dlg = $('#ytlcc-editor-modal');
-    if (!dlg) return;
-
-    $('#ytlcc-edit-no').value = ch.chapter_number;
-    $('#ytlcc-edit-title').value = ch.title;
-    $('#ytlcc-edit-price').value = ch.stars_active;
-    $('#ytlcc-edit-password').value = ch.password || '';
-    $('#ytlcc-edit-content').value = htmlToPlain(ch.content);
-
-    dlg.dataset.chapterNo = String(ch.chapter_number);
-    dlg.classList.add('show');
-  }
-
-  async function saveSingleEditor() {
-    const dlg = $('#ytlcc-editor-modal');
-    const no = Number(dlg?.dataset.chapterNo || 0);
-    const ch = state.chapterMap.get(no);
-    if (!ch) return;
-
-    if (!confirm(`Lưu thay đổi Chương ${no}?`)) return;
+    openModal(`Sửa CHƯƠNG ${chapterNo}`, '<div class="ttlcc-loading">Đang đọc form chương…</div>');
+    const host = $('#ttlcc-modal-body');
 
     try {
-      setStatus(`Đang lưu Chương ${no}...`);
-      await updateChapter(ch, {
-        title: $('#ytlcc-edit-title').value.trim(),
-        stars_active: Math.max(0, Number($('#ytlcc-edit-price').value || 0)),
-        password: $('#ytlcc-edit-password').value,
-        content: plainToHtml($('#ytlcc-edit-content').value),
+      const { doc, finalUrl } = await fetchDoc(row.editUrl, `GET edit CHƯƠNG ${chapterNo}`);
+      const form = findChapterForm(doc, 'edit');
+      if (!form) throw new Error('Không tìm thấy form PUT chương.');
+      const model = formToModel(form, finalUrl);
+
+      const ui = renderLiveForm(host, model, {
+        title: `${row.title} · ID ${row.chapterId}`,
+        submitText: 'Cập nhật chương',
+        onSubmit: async (uiForm, liveModel, btn) => {
+          if (!confirm(`Cập nhật CHƯƠNG ${chapterNo} thật lên server?`)) return;
+
+          const content = uiForm.querySelector('[name="content_chapter"]')?.value || '';
+          const wc = uiForm.querySelector('[name="word_count2"]');
+          if (wc) wc.value = String(countWordsFromHtml(content));
+
+          btn.disabled = true;
+          try {
+            await submitRenderedForm(uiForm, liveModel, `PUT CHƯƠNG ${chapterNo}`);
+            toast(`Đã lưu CHƯƠNG ${chapterNo}. Đang re-check…`, 'ok');
+            await sleep(450);
+            await loadChapters();
+            closeModal();
+          } catch (err) {
+            toast(`Lưu CHƯƠNG ${chapterNo} lỗi: ${err.message}`, 'error', 6000);
+          } finally {
+            btn.disabled = false;
+          }
+        },
       });
 
-      toast(`Đã lưu Chương ${no}.`, 'success');
-      dlg.classList.remove('show');
-      await loadChapters();
+      bindScheduleFields(ui);
     } catch (err) {
-      toast(`Không lưu được Chương ${no}: ${err.message}`, 'error', 6000);
+      host.innerHTML = `<div class="ttlcc-error-box">${esc(err.message)}</div>`;
     }
   }
 
-  function parseChapterSelector(raw, chapters = state.chapters) {
-    const spec = String(raw || '').trim();
-    if (!spec) {
-      throw new Error('Chưa nhập phạm vi chương.');
-    }
+  async function openCreateChapter() {
+    if (!state.selectedStoryId) return toast('Chưa chọn truyện.', 'warn');
 
-    const sorted = [...chapters].sort(
-      (a, b) => Number(a.chapter_number) - Number(b.chapter_number)
-    );
-    const byNo = new Map(
-      sorted.map(ch => [Number(ch.chapter_number), ch])
-    );
-
-    if (/^h$/i.test(spec)) {
-      const selected = sorted.filter(ch => isHChapterTitle(ch.title));
-      if (!selected.length) {
-        throw new Error('Không tìm thấy chương có token H trong tên.');
-      }
-      return {
-        chapters: selected,
-        missing: [],
-        label: 'H',
-      };
-    }
-
-    if (/^(?:\*|all|tất\s*cả)$/iu.test(spec)) {
-      if (!sorted.length) {
-        throw new Error('Truyện chưa có chương.');
-      }
-      return {
-        chapters: sorted,
-        missing: [],
-        label: '*',
-      };
-    }
-
-    const wanted = new Set();
-    const tokens = spec
-      .split(/[,;\s]+/)
-      .map(x => x.trim())
-      .filter(Boolean);
-
-    if (!tokens.length) {
-      throw new Error('Phạm vi chương không hợp lệ.');
-    }
-
-    for (const token of tokens) {
-      let m = token.match(/^(\d+)$/);
-      if (m) {
-        wanted.add(Number(m[1]));
-        continue;
-      }
-
-      m = token.match(/^(\d+)\s*[-–—]\s*(\d+)$/);
-      if (m) {
-        let a = Number(m[1]);
-        let b = Number(m[2]);
-        if (a > b) [a, b] = [b, a];
-
-        // Chặn range nhập nhầm quá lớn.
-        if (b - a > 10000) {
-          throw new Error(`Range quá lớn: ${token}`);
-        }
-
-        for (let n = a; n <= b; n++) wanted.add(n);
-        continue;
-      }
-
-      throw new Error(`Không hiểu phạm vi: "${token}"`);
-    }
-
-    const numbers = [...wanted].sort((a, b) => a - b);
-    const selected = [];
-    const missing = [];
-
-    for (const no of numbers) {
-      const ch = byNo.get(no);
-      if (ch) selected.push(ch);
-      else missing.push(no);
-    }
-
-    if (!selected.length) {
-      throw new Error('Không có chương nào trong phạm vi tồn tại trên server.');
-    }
-
-    return {
-      chapters: selected,
-      missing,
-      label: spec,
-    };
-  }
-
-  function openBulkPassModal() {
-    const modal = $('#ytlcc-pass-modal');
-    if (!modal) return;
-
-    const selector = $('#ytlcc-pass-range');
-    const password = $('#ytlcc-pass-value');
-
-    if (selector && !selector.value.trim()) {
-      selector.value = 'H';
-    }
-    if (password) {
-      password.value = getHPassword();
-    }
-
-    modal.classList.add('show');
-    setTimeout(() => selector?.focus(), 0);
-  }
-
-  function closeBulkPassModal() {
-    if (state.running) return;
-    $('#ytlcc-pass-modal')?.classList.remove('show');
-  }
-
-  async function bulkSetExistingPassword({ clear = false } = {}) {
-    if (!state.selectedStoryId) {
-      throw new Error('Chưa chọn truyện.');
-    }
-
-    // Snapshot mới nhất trước khi lập target.
-    await loadChapters();
-
-    const spec = $('#ytlcc-pass-range')?.value || '';
-    const selection = parseChapterSelector(spec, state.chapters);
-
-    const passInput = $('#ytlcc-pass-value');
-    const nextPassword = clear
-      ? ''
-      : String(passInput?.value || '');
-
-    if (!clear && !nextPassword) {
-      throw new Error('Pass không được để trống. Nếu muốn bỏ pass, dùng "Xóa pass".');
-    }
-
-    const targets = selection.chapters
-      .filter(ch => String(ch.password || '') !== nextPassword)
-      .map(ch => ({
-        no: Number(ch.chapter_number),
-        ch,
-        overrides: { password: nextPassword },
-      }));
-
-    const unchangedCount = selection.chapters.length - targets.length;
-
-    if (!targets.length) {
-      const msg = clear
-        ? `Các chương đã chọn đều không có pass.`
-        : `Các chương đã chọn đã dùng đúng pass này.`;
-      setStatus(msg, 'success');
-      toast(msg, 'success');
-      return;
-    }
-
-    const missingText = selection.missing.length
-      ? `\nKhông tồn tại, sẽ bỏ qua: ${selection.missing.join(', ')}`
-      : '';
-
-    const action = clear ? 'XÓA PASS' : 'ĐỔI PASS';
-
-    if (
-      !confirm(
-        `${action} hàng loạt\n\n` +
-        `Phạm vi: ${selection.label}\n` +
-        `Sẽ cập nhật: ${targets.length} chương\n` +
-        `Đã đúng sẵn: ${unchangedCount} chương` +
-        missingText +
-        `\n\nTiếp tục?`
-      )
-    ) return;
-
-    // Pass nhập trong modal cũng trở thành Pass H mặc định được lưu local.
-    if (!clear) {
-      state.bulk.hPassword = nextPassword;
-      const mainPass = $('#ytlcc-h-password');
-      if (mainPass) mainPass.value = nextPassword;
-      savePrefs();
-    }
-
-    state.running = true;
-    state.cancelled = false;
-    renderRunState();
+    openModal('Thêm chương mới', '<div class="ttlcc-loading">Đang đọc form tạo chương…</div>');
+    const host = $('#ttlcc-modal-body');
 
     try {
-      let completed = 0;
-      setStatus(`${action}: 0/${targets.length}...`);
+      const url = routeUrl(`/createchapter/${state.selectedStoryId}`);
+      const { doc, finalUrl } = await fetchDoc(url, 'GET form tạo chương');
+      const form = findChapterForm(doc, 'create');
+      if (!form) throw new Error('Không tìm thấy form POST /chapter.');
+      const model = formToModel(form, finalUrl);
+      state.chapterCreateModel = model;
 
-      const results = await runPool(
-        targets,
-        CFG.writeConcurrency,
-        async target => {
-          if (state.cancelled) throw new Error('Đã hủy.');
+      const ui = renderLiveForm(host, model, {
+        title: `Truyện #${state.selectedStoryId}`,
+        submitText: 'Đăng chương',
+        onSubmit: async (uiForm, liveModel, btn) => {
+          const name = text(uiForm.querySelector('[name="name_chapter"]')?.value || '');
+          if (!name) return toast('Tên chương đang rỗng.', 'warn');
+          if (!confirm(`Đăng chương mới "${name}"?`)) return;
 
-          await updateChapter(
-            target.ch,
-            target.overrides,
-            `${clear ? 'CLEAR PASS' : 'SET PASS'} Chương ${target.no}`
-          );
+          const content = uiForm.querySelector('[name="content_chapter"]')?.value || '';
+          const wc = countWordsFromHtml(content);
+          const wcEl = uiForm.querySelector('[name="word_count2"]');
+          if (wcEl) wcEl.value = String(wc);
 
-          completed++;
-          setStatus(`${action}: ${completed}/${targets.length}...`);
-          addLog(
-            `${clear ? 'CLEAR PASS' : 'SET PASS'} OK Chương ${target.no} (${completed}/${targets.length}).`
-          );
+          if (wc > 0 && wc < CFG.pricing.minPaidWords) {
+            const s = uiForm.querySelector('[name="stars_active"]');
+            const d = uiForm.querySelector('[name="diamonds_active"]');
+            if (s) s.value = '0';
+            if (d) d.value = '0';
+          }
 
-          const delay = clamp(
-            Number($('#ytlcc-bulk-delay')?.value || CFG.writeGapMs),
-            180,
-            5000
-          );
-          await sleep(delay);
+          btn.disabled = true;
+          try {
+            await submitRenderedForm(uiForm, liveModel, 'POST tạo chương');
+            toast('Server đã nhận chương mới. Đang xác minh danh sách…', 'ok');
+            await sleep(600);
+            await loadChapters();
+            closeModal();
+          } catch (err) {
+            toast(`Đăng chương lỗi: ${err.message}`, 'error', 6000);
+          } finally {
+            btn.disabled = false;
+          }
+        },
+      });
 
-          return target.no;
-        }
-      );
-
-      const failed = targets.filter((_, i) => !results[i]?.ok);
-
-      if (failed.length) {
-        for (const target of failed) {
-          const idx = targets.indexOf(target);
-          addLog(
-            `${action} FAIL Chương ${target.no}: ` +
-            `${results[idx]?.error?.message || 'unknown'}`,
-            'error'
-          );
-        }
-
-        throw new Error(
-          `${failed.length}/${targets.length} chương cập nhật pass thất bại.`
-        );
-      }
-
-      setStatus('Đã ghi xong. Đang verify pass...');
-      await sleep(450);
-
-      const verify = await verifyTargets(targets);
-
-      if (!verify.ok) {
-        throw new Error(
-          `VERIFY pass thất bại ở chương: ${verify.failed.map(x => x.no).join(', ')}`
-        );
-      }
-
-      const msg =
-        `${clear ? 'Xóa' : 'Đổi'} pass PASS ${targets.length}/${targets.length} chương.`;
-
-      $('#ytlcc-pass-modal')?.classList.remove('show');
-      setStatus(msg, 'success');
-      toast(msg, 'success', 5000);
-      addLog(msg, 'success');
-    } finally {
-      state.running = false;
-      renderRunState();
+      bindScheduleFields(ui);
+    } catch (err) {
+      host.innerHTML = `<div class="ttlcc-error-box">${esc(err.message)}</div>`;
     }
   }
 
-  async function loadTxtFiles(fileList) {
+  function bindScheduleFields(form) {
+    const radios = $$('[name="publish_mode"]', form);
+    const at = $('[name="publish_at"]', form);
+    if (!radios.length || !at) return;
+
+    const sync = () => {
+      const selected = radios.find(r => r.checked)?.value || 'now';
+      at.disabled = selected !== 'schedule';
+    };
+    radios.forEach(r => r.addEventListener('change', sync));
+    sync();
+  }
+
+  async function deleteChapter(chapterNo) {
+    const row = state.chapterMap.get(Number(chapterNo));
+    if (!row?.deleteModel) return toast('Không tìm thấy form DELETE thật của chương.', 'error');
+
+    if (!confirm(`XÓA CHƯƠNG ${chapterNo}: ${row.title}\n\nThao tác này không thể hoàn tác. Tiếp tục?`)) return;
+    const verify = prompt(`Gõ đúng số chương ${chapterNo} để xác nhận xóa:`);
+    if (String(verify).trim() !== String(chapterNo)) {
+      return toast('Hủy xóa: mã xác nhận không khớp.', 'warn');
+    }
+
+    try {
+      const p = modelToParams(row.deleteModel);
+      await postOnce(row.deleteModel.action, {
+        rawMethod: row.deleteModel.rawMethod || 'POST',
+        body: p.toString(),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+        label: `DELETE CHƯƠNG ${chapterNo}`,
+      });
+      toast(`Đã gửi xóa CHƯƠNG ${chapterNo}. Đang re-check…`, 'ok');
+      await sleep(500);
+      await loadChapters();
+      if (state.chapterMap.has(Number(chapterNo))) {
+        toast(`Re-check: CHƯƠNG ${chapterNo} vẫn còn trên server.`, 'error', 6000);
+      }
+    } catch (err) {
+      toast(`Xóa CHƯƠNG ${chapterNo} lỗi: ${err.message}`, 'error', 6000);
+    }
+  }
+
+  // ==========================================================
+  // BULK CHAPTER ENGINE
+  // ==========================================================
+
+  function plainTextToHtml(raw) {
+    const input = String(raw || '').replace(/\r\n?/g, '\n').trim();
+    if (!input) return '';
+    if (/<(?:p|div|br|blockquote|h[1-6]|ul|ol|li|table|pre)\b/i.test(input)) return input;
+    return input
+      .split('\n')
+      .map(x => x.trim())
+      .filter(Boolean)
+      .map(x => `<p>${esc(x)}</p>`)
+      .join('');
+  }
+
+  function sanitizeChapterTitle(value, expectedNo = null) {
+    let title = text(value);
+
+    for (let i = 0; i < 4; i++) {
+      const m = title.match(/^chương\s+(\d+)\s*(?::|：|-|–|—|\.)?\s*(.*)$/i);
+      if (!m) break;
+      const embedded = Number(m[1]);
+      if (expectedNo !== null && Number(expectedNo) !== embedded) {
+        throw new Error(`CHƯƠNG ${expectedNo} chứa nhãn CHƯƠNG ${embedded}: dừng để tránh map sai.`);
+      }
+      title = text(m[2]);
+      if (!title) throw new Error(`CHƯƠNG ${expectedNo ?? embedded} không có tên thật.`);
+    }
+
+    if (!title) throw new Error(`CHƯƠNG ${expectedNo ?? '?'} có tên rỗng.`);
+    return title;
+  }
+
+  function parseTxtBatch(raw) {
+    const input = String(raw || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+    const re = /^Chương\s+(\d+)\s*:\s*(.+?)\s*$/gim;
+    const hits = [];
+    let m;
+    while ((m = re.exec(input))) {
+      hits.push({ chapterNo: Number(m[1]), titleRaw: m[2], start: m.index, contentStart: re.lastIndex });
+    }
+    if (!hits.length) throw new Error('Không tìm thấy tiêu đề dạng "CHƯƠNG X: Tên chương".');
+
+    const out = hits.map((h, i) => {
+      const end = i + 1 < hits.length ? hits[i + 1].start : input.length;
+      const rawContent = input.slice(h.contentStart, end).trim();
+      return {
+        chapterNo: h.chapterNo,
+        title: sanitizeChapterTitle(h.titleRaw, h.chapterNo),
+        rawContent,
+        htmlContent: plainTextToHtml(rawContent),
+      };
+    });
+
+    const seen = new Set();
+    for (const x of out) {
+      if (seen.has(x.chapterNo)) throw new Error(`Trùng CHƯƠNG ${x.chapterNo} trong TXT.`);
+      seen.add(x.chapterNo);
+    }
+    return out.sort((a, b) => a.chapterNo - b.chapterNo);
+  }
+
+  function applyParsedTxtBatch(parsed, message = '') {
+    const rows = [...(parsed || [])].sort((a, b) => a.chapterNo - b.chapterNo);
+    if (!rows.length) throw new Error('Batch TXT không có chương hợp lệ.');
+
+    // TXT mới = batch mới. Không kế thừa giá create từ batch cũ.
+    state.bulk.pricing.clear();
+    state.bulk.parsed = rows;
+
+    const nums = rows.map(x => x.chapterNo);
+    const first = Math.min(...nums);
+    const last = Math.max(...nums);
+
+    $('#ttlcc-bulk-from').value = first;
+    $('#ttlcc-bulk-to').value = last;
+    $('#ttlcc-price-from').value = first;
+    $('#ttlcc-price-to').value = last;
+
+    for (const item of rows) getPricing(item.chapterNo);
+
+    renderBulkPreview();
+
+    if (message) toast(message, 'ok');
+  }
+
+  async function loadBulkTxtFiles(fileList) {
     const files = [...(fileList || [])];
     if (!files.length) return;
 
@@ -1120,63 +1571,57 @@
 
     if (invalid.length) {
       throw new Error(
-        `Chỉ hỗ trợ TXT. File không hợp lệ: ${invalid.map(f => f.name || '(không tên)').join(', ')}`
+        `Chỉ hỗ trợ TXT: ${invalid.map(f => f.name || '(không tên)').join(', ')}`
       );
     }
 
-    const loaded = [];
+    const batches = [];
 
     for (const file of files) {
-      let raw = await file.text();
-      raw = String(raw || '').replace(/^\uFEFF/, '');
+      const raw = String(await file.text())
+        .replace(/^\uFEFF/, '')
+        .replace(/\r\n?/g, '\n');
 
       let parsed;
       try {
-        parsed = parseBulkText(raw);
+        parsed = parseTxtBatch(raw);
       } catch (err) {
         throw new Error(`${file.name || 'TXT'}: ${err.message}`);
       }
 
-      if (!parsed.length) {
-        throw new Error(`${file.name || 'TXT'}: không có chương hợp lệ.`);
-      }
-
-      loaded.push({
+      batches.push({
         file,
         raw,
         parsed: parsed.map(item => ({
           ...item,
           sourceFile: String(file.name || 'TXT'),
         })),
-        firstChapter: Math.min(...parsed.map(x => Number(x.chapterNo))),
-        lastChapter: Math.max(...parsed.map(x => Number(x.chapterNo))),
+        first: parsed[0]?.chapterNo ?? Number.MAX_SAFE_INTEGER,
+        last: parsed.at(-1)?.chapterNo ?? 0,
       });
     }
 
-    // Xếp file theo chương đầu để textarea và preview có thứ tự ổn định.
-    loaded.sort((a, b) => {
-      const d = a.firstChapter - b.firstChapter;
-      if (d) return d;
-      return String(a.file.name || '').localeCompare(String(b.file.name || ''), 'vi');
-    });
+    // Sắp xếp theo chương đầu, không phụ thuộc thứ tự click chọn file.
+    batches.sort((a, b) =>
+      (a.first - b.first) ||
+      String(a.file.name || '').localeCompare(String(b.file.name || ''), 'vi')
+    );
 
-    // Kiểm tra trùng chapter_number giữa các file trước khi thay state/UI.
-    const ownerByChapter = new Map();
+    // Chặn trùng chapter_number giữa nhiều file.
+    const owner = new Map();
     const duplicates = [];
 
-    for (const entry of loaded) {
-      for (const item of entry.parsed) {
+    for (const batch of batches) {
+      for (const item of batch.parsed) {
         const no = Number(item.chapterNo);
-        const previous = ownerByChapter.get(no);
-
-        if (previous) {
+        if (owner.has(no)) {
           duplicates.push({
             no,
-            first: previous,
-            second: entry.file.name || 'TXT',
+            first: owner.get(no),
+            second: batch.file.name || 'TXT',
           });
         } else {
-          ownerByChapter.set(no, entry.file.name || 'TXT');
+          owner.set(no, batch.file.name || 'TXT');
         }
       }
     }
@@ -1184,2300 +1629,2069 @@
     if (duplicates.length) {
       const detail = duplicates
         .slice(0, 12)
-        .map(x => `Chương ${x.no}: "${x.first}" ↔ "${x.second}"`)
+        .map(x => `CHƯƠNG ${x.no}: "${x.first}" ↔ "${x.second}"`)
         .join('; ');
 
-      const more = duplicates.length > 12
-        ? `; ... +${duplicates.length - 12} lỗi trùng`
-        : '';
-
-      throw new Error(`Trùng chương giữa các TXT: ${detail}${more}`);
+      throw new Error(
+        `Trùng chương giữa các file: ${detail}` +
+        (duplicates.length > 12 ? `; ... +${duplicates.length - 12}` : '')
+      );
     }
 
-    const merged = loaded
-      .flatMap(entry => entry.parsed)
-      .sort((a, b) => Number(a.chapterNo) - Number(b.chapterNo));
+    const merged = batches
+      .flatMap(batch => batch.parsed)
+      .sort((a, b) => a.chapterNo - b.chapterNo);
 
-    // Gộp raw theo thứ tự file đã chuẩn hóa. Không chèn tên file vào raw
-    // để tránh làm bẩn nội dung chương cuối của từng file.
-    const combinedRaw = loaded
-      .map(entry => entry.raw.trim())
+    // Textarea chỉ để user kiểm tra/chỉnh tay. State parsed được tạo trực tiếp
+    // từ từng file nên ranh giới file không thể làm parser nuốt nhầm chương.
+    $('#ttlcc-bulk-text').value = batches
+      .map(batch => batch.raw.trim())
       .filter(Boolean)
       .join('\n\n\n');
 
-    const input = $('#ytlcc-bulk-input');
-    if (!input) throw new Error('Không tìm thấy ô dữ liệu TXT.');
-
-    input.value = combinedRaw;
-    state.bulk.parsed = merged;
-
-    const totalBytes = files.reduce((sum, file) => sum + Number(file.size || 0), 0);
-    const fileLabel = $('#ytlcc-txt-file-name');
-
-    if (fileLabel) {
-      const names = loaded.map(x => x.file.name || 'TXT');
-      const shortNames =
-        names.length <= 2
-          ? names.join(' + ')
-          : `${names[0]} + ${names[1]} +${names.length - 2}`;
-
-      fileLabel.textContent =
-        `${files.length} TXT · ${shortNames} · ` +
-        `${(totalBytes / 1024).toLocaleString('vi-VN', { maximumFractionDigits: 1 })} KB`;
-
-      fileLabel.title = names.join('\n');
-    }
-
-    renderBulkPreview();
-
     const first = merged[0]?.chapterNo;
     const last = merged.at(-1)?.chapterNo;
-    const hCount = merged.filter(x => x.isH).length;
+
+    applyParsedTxtBatch(
+      merged,
+      `Đã nạp ${files.length} TXT · ${merged.length} chương` +
+      (first != null ? ` · CHƯƠNG ${first}–${last}` : '')
+    );
 
     addLog(
-      `Đã nạp ${files.length} TXT: ${merged.length} chương` +
-      (first != null ? ` (${first}→${last})` : '') +
-      (hCount ? `, H=${hCount}` : '') +
+      `Multi-TXT: ${files.length} file, ${merged.length} chương` +
+      (first != null ? ` (${first}–${last})` : '') +
       '.'
     );
-
-    toast(
-      `Đã gộp ${files.length} TXT · ${merged.length} chương.`,
-      'success',
-      4200
-    );
   }
 
-  async function loadTxtFile(file) {
-    // Giữ compatibility nếu code cũ hoặc thao tác khác còn gọi hàm single-file.
-    return loadTxtFiles(file ? [file] : []);
-  }
-
-
-  function isHChapterTitle(rawTitle) {
-    const title = String(rawTitle ?? '')
-      .normalize('NFKC')
-      .replace(/\u00A0/g, ' ')
-      .trim();
-
-    if (!title) return false;
-
-    // H phải là token độc lập. Match H, [H], (H), "- H -", "H cao", ...
-    // Không match chữ h nằm trong từ khác như "Hoa", "Hệ thống", "Hạ".
-    return /(^|[\s\[\](){}<>:;,.!?\-–—_/\\|])H(?=$|[\s\[\](){}<>:;,.!?\-–—_/\\|])/iu.test(title);
-  }
-
-  function getHPassword() {
-    const input = $('#ytlcc-h-password');
-    if (input) {
-      state.bulk.hPassword = String(input.value || '');
-    }
-    return String(state.bulk.hPassword || '');
-  }
-
-  // ============================================================
-  // BULK PARSER
-  // ============================================================
-
-  function htmlToPlain(html) {
-    const doc = new DOMParser().parseFromString(`<div>${html || ''}</div>`, 'text/html');
-    const root = doc.body.firstElementChild;
-    if (!root) return '';
-
-    for (const br of root.querySelectorAll('br')) br.replaceWith('\n');
-
-    for (const p of root.querySelectorAll('p,div,li,h1,h2,h3,h4,h5,h6,blockquote')) {
-      p.insertAdjacentText('beforeend', '\n');
-    }
-
-    return (root.textContent || '')
-      .replace(/\u00A0/g, ' ')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-  }
-
-  function plainToHtml(raw) {
-    raw = String(raw ?? '').replace(/\r\n?/g, '\n').trim();
-    if (!raw) return '';
-
-    return raw
-      .split(/\n{2,}/)
-      .map(block => {
-        const lines = block
-          .split('\n')
-          .map(line => esc(line))
-          .join('<br>');
-        return `<p>${lines}</p>`;
-      })
-      .join('\n');
-  }
-
-  function parseBulkText(raw) {
-    raw = String(raw ?? '').replace(/\r\n?/g, '\n');
-
-    const heading =
-      /^\s*(?:chương|chuong|chapter|ch\.?)\s+(\d+(?:\.\d+)?)\s*(?:[:.\-–—]\s*(.*?))?\s*$/gim;
-
-    const matches = [...raw.matchAll(heading)];
-    if (!matches.length) {
-      throw new Error('Không tìm thấy heading dạng "Chương N" / "Chapter N".');
-    }
-
-    const items = [];
-
-    for (let i = 0; i < matches.length; i++) {
-      const m = matches[i];
-      const start = m.index + m[0].length;
-      const end = i + 1 < matches.length ? matches[i + 1].index : raw.length;
-      const no = Number(m[1]);
-      const suffix = String(m[2] || '').trim();
-      const body = raw.slice(start, end).trim();
-
-      if (!Number.isFinite(no)) continue;
-
-      const isH = isHChapterTitle(suffix);
-
-      items.push({
-        chapterNo: no,
-
-        // YTL lưu số chương riêng ở chapter_number.
-        title: suffix,
-        shortTitle: suffix,
-        createTitle: suffix || `Chương ${no}`,
-        isH,
-
-        contentPlain: body,
-        contentHtml: plainToHtml(body),
-        charCount: body.length,
-      });
-    }
-
-    // Reject duplicate chapter numbers.
-    const seen = new Set();
-    for (const item of items) {
-      if (seen.has(item.chapterNo)) {
-        throw new Error(`Trùng số chương ${item.chapterNo}.`);
-      }
-      seen.add(item.chapterNo);
-    }
-
-    return items.sort((a, b) => a.chapterNo - b.chapterNo);
-  }
-
-  function parseBulkFromUi() {
-    try {
-      const raw = $('#ytlcc-bulk-input')?.value || '';
-      state.bulk.parsed = parseBulkText(raw);
-      renderBulkPreview();
-      toast(`Đã parse ${state.bulk.parsed.length} chương.`, 'success');
-    } catch (err) {
-      state.bulk.parsed = [];
-      renderBulkPreview();
-      toast(err.message, 'error', 5000);
-    }
-  }
-
-  function renderBulkPreview() {
-    const body = $('#ytlcc-bulk-preview-body');
-    const summary = $('#ytlcc-bulk-summary');
-    if (!body || !summary) return;
-
-    const items = state.bulk.parsed || [];
-
-    if (!items.length) {
-      summary.textContent = 'Chưa parse dữ liệu.';
-      body.innerHTML =
-        '<tr><td colspan="5" class="ytlcc-empty">Nạp TXT hoặc dán nội dung rồi Phân tích.</td></tr>';
-      return;
-    }
-
-    const first = items[0]?.chapterNo;
-    const last = items.at(-1)?.chapterNo;
-    const hCount = items.filter(x => x.isH).length;
-
-    summary.textContent =
-      `${items.length} chương · ${first} → ${last} · ` +
-      `${items.reduce((n, x) => n + x.charCount, 0).toLocaleString('vi-VN')} ký tự` +
-      (hCount ? ` · H: ${hCount}` : '');
-
-    body.innerHTML = items.slice(0, 250).map(x => `
-      <tr>
-        <td>${x.chapterNo}</td>
-        <td class="ytlcc-title-cell">${esc(x.title || '(không có tên chương)')}</td>
-        <td>${x.charCount.toLocaleString('vi-VN')}</td>
-        <td>${x.isH ? '<span class="ytlcc-h-badge">H</span>' : ''}</td>
-        <td>${state.chapterMap.has(Number(x.chapterNo)) ? 'Đã có' : 'Mới'}</td>
-      </tr>
-    `).join('');
-  }
-
-  function ensureContiguous(items) {
-    if (!items.length) return false;
-    for (let i = 1; i < items.length; i++) {
-      if (Number(items[i].chapterNo) !== Number(items[i - 1].chapterNo) + 1) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  // ============================================================
-  // SMART TXT SYNC
-  // Có thì cập nhật, thiếu thì đăng. Mapping bằng chapter_number.
-  // ============================================================
-
-  function normalizePlainText(raw) {
-    return String(raw ?? '')
-      .replace(/\r\n?/g, '\n')
-      .replace(/\u00A0/g, ' ')
-      .split('\n')
-      .map(line => line.replace(/[ \t]+/g, ' ').trimEnd())
-      .join('\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-  }
-
-  function chapterContentComparable(ch) {
-    return normalizePlainText(htmlToPlain(ch?.content || ''));
-  }
-
-  function itemContentComparable(item) {
-    return normalizePlainText(item?.contentPlain || '');
-  }
-
-  function titleComparable(raw) {
-    return String(raw ?? '')
-      .replace(/\u00A0/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
-  async function createChapter(item) {
-    const storyId = Number(state.selectedStoryId);
-    if (!storyId) throw new Error('Chưa chọn truyện.');
-
-    const fd = new FormData();
-    fd.set('_token', csrfFrom());
-    fd.set('chapter_number', String(item.chapterNo));
-    fd.set('title', String(item.createTitle || item.title || `Chương ${item.chapterNo}`));
-    fd.set('content', String(item.contentHtml || ''));
-    fd.set('password', item.isH ? getHPassword() : '');
-    fd.set(
-      'stars_active',
-      String(Math.max(0, Number($('#ytlcc-bulk-price')?.value || 0)))
-    );
-    fd.set('publish_type', 'now');
-    fd.set('published_at', '');
-
-    // CREATE không blind retry. Timeout/5xx có thể đã ghi thành công,
-    // nên nếu lỗi phải reconcile trước khi quyết định.
-    try {
-      return await postForm(
-        route(`/profile/stories/${storyId}/chapters`),
-        fd,
-        `CREATE Chương ${item.chapterNo}`,
-        { attempts: 1 }
-      );
-    } catch (err) {
-      addLog(
-        `CREATE Chương ${item.chapterNo} trả lỗi/không rõ trạng thái; đang reconcile trước khi dừng.`,
-        'warn'
-      );
-
-      try {
-        await sleep(500);
-        const snap = await fetchChapterSnapshot(storyId);
-        const actual = snap.chapters.find(
-          ch => Number(ch.chapter_number) === Number(item.chapterNo)
-        );
-
-        if (actual) {
-          const titleOk =
-            !item.title ||
-            titleComparable(actual.title) === titleComparable(item.title);
-
-          const contentOk =
-            chapterContentComparable(actual) === itemContentComparable(item);
-
-          const hPassword = getHPassword();
-          const passwordOk =
-            !item.isH ||
-            !hPassword ||
-            String(actual.password || '') === hPassword;
-
-          if (titleOk && contentOk && passwordOk) {
-            addLog(
-              `RECONCILE CREATE Chương ${item.chapterNo}: server đã có dữ liệu đúng, coi là PASS.`,
-              'warn'
-            );
-            return { success: true, reconciled: true };
-          }
-
-          throw new Error(
-            `Chương ${item.chapterNo} đã xuất hiện sau lỗi CREATE nhưng dữ liệu không khớp. Dừng để tránh ghi đè mù.`
-          );
-        }
-      } catch (reconcileErr) {
-        if (/đã xuất hiện/.test(String(reconcileErr?.message || ''))) {
-          throw reconcileErr;
-        }
-        addLog(
-          `Reconcile Chương ${item.chapterNo} cũng lỗi: ${reconcileErr.message || reconcileErr}`,
-          'warn'
-        );
-      }
-
-      throw err;
-    }
-  }
-
-  function buildSmartSyncPlan(mode) {
-    const parsed = state.bulk.parsed || [];
-    if (!parsed.length) throw new Error('Chưa parse TXT.');
-
-    const plan = {
-      mode,
-      updates: [],
-      creates: [],
-      unchanged: [],
-      skippedExisting: [],
-      skippedMissing: [],
-    };
-
-    for (const item of parsed) {
-      const no = Number(item.chapterNo);
-      const existing = state.chapterMap.get(no);
-
-      if (existing) {
-        if (mode === 'missing_only') {
-          plan.skippedExisting.push(no);
-          continue;
-        }
-
-        const overrides = {};
-
-        const currentContent = chapterContentComparable(existing);
-        const incomingContent = itemContentComparable(item);
-
-        if (currentContent !== incomingContent) {
-          overrides.content = item.contentHtml;
-        }
-
-        // Chỉ đổi tên khi TXT thật sự có tên chương.
-        // TXT chỉ ghi "Chương 12" sẽ không xóa tên hiện tại.
-        if (
-          item.title &&
-          titleComparable(existing.title) !== titleComparable(item.title)
-        ) {
-          overrides.title = item.title;
-        }
-
-        const hPassword = getHPassword();
-        if (
-          item.isH &&
-          hPassword &&
-          String(existing.password || '') !== hPassword
-        ) {
-          overrides.password = hPassword;
-        }
-
-        if (Object.keys(overrides).length) {
-          plan.updates.push({
-            no,
-            ch: existing,
-            item,
-            overrides,
-          });
-        } else {
-          plan.unchanged.push(no);
-        }
-      } else {
-        if (mode === 'existing_only') {
-          plan.skippedMissing.push(no);
-          continue;
-        }
-
-        plan.creates.push({
-          no,
-          item,
-        });
-      }
-    }
-
-    return plan;
-  }
-
-  async function verifySmartSync(plan) {
-    const snap = await fetchChapterSnapshot();
-    const map = new Map(
-      snap.chapters.map(ch => [Number(ch.chapter_number), ch])
-    );
-
-    const failed = [];
-
-    for (const target of plan.updates) {
-      const actual = map.get(Number(target.no));
-      if (!actual || !matchesExpected(actual, target.overrides)) {
-        failed.push({
-          no: target.no,
-          type: 'update',
-        });
-      }
-    }
-
-    for (const target of plan.creates) {
-      const actual = map.get(Number(target.no));
-      if (!actual) {
-        failed.push({
-          no: target.no,
-          type: 'create-missing',
-        });
-        continue;
-      }
-
-      const titleOk =
-        !target.item.title ||
-        titleComparable(actual.title) === titleComparable(target.item.title);
-
-      const contentOk =
-        chapterContentComparable(actual) === itemContentComparable(target.item);
-
-      const hPassword = getHPassword();
-      const passwordOk =
-        !target.item.isH ||
-        !hPassword ||
-        String(actual.password || '') === hPassword;
-
-      if (!titleOk || !contentOk || !passwordOk) {
-        failed.push({
-          no: target.no,
-          type: 'create-mismatch',
-        });
-      }
-    }
-
-    state.chapters = snap.chapters.sort(
-      (a, b) => Number(a.chapter_number) - Number(b.chapter_number)
-    );
-    state.chapterMap = map;
-
-    if (snap.story) {
-      state.selectedStory = {
-        ...(state.stories.get(Number(state.selectedStoryId)) || {}),
-        ...snap.story,
-        chapters_count: state.chapters.length,
-      };
-      state.stories.set(Number(state.selectedStoryId), state.selectedStory);
-    }
-
-    renderStories();
-    renderSelectedStory();
-    renderChapters();
-    renderBulkPreview();
-
-    return {
-      ok: failed.length === 0,
-      failed,
-    };
-  }
-
-  async function smartSyncTxt() {
-    if (!state.selectedStoryId) throw new Error('Chưa chọn truyện.');
-    if (!state.bulk.parsed.length) throw new Error('Chưa parse TXT.');
-
-    // Snapshot ngay trước khi lập plan để tránh dùng mapping cũ.
-    await loadChapters();
-
-    const mode =
-      $('#ytlcc-sync-mode')?.value ||
-      'upsert';
-
-    const plan = buildSmartSyncPlan(mode);
-
-    const totalActions = plan.updates.length + plan.creates.length;
-
-    if (!totalActions) {
-      const msg =
-        `Không có gì cần ghi. ` +
-        `${plan.unchanged.length} chương đã khớp` +
-        (plan.skippedExisting.length
-          ? `, bỏ qua ${plan.skippedExisting.length} chương đã có`
-          : '') +
-        (plan.skippedMissing.length
-          ? `, bỏ qua ${plan.skippedMissing.length} chương chưa có`
-          : '') +
-        '.';
-
-      setStatus(msg, 'success');
-      toast(msg, 'success', 4500);
-      return;
-    }
-
-    const modeLabel = {
-      upsert: 'Có thì cập nhật, thiếu thì đăng',
-      missing_only: 'Chỉ đăng chương còn thiếu',
-      existing_only: 'Chỉ cập nhật chương đã có',
-    }[mode] || mode;
-
-    const confirmText =
-      `${modeLabel}\n\n` +
-      `Cập nhật: ${plan.updates.length}\n` +
-      `Đăng mới: ${plan.creates.length}\n` +
-      `Đã khớp, không ghi: ${plan.unchanged.length}\n` +
-      `Bỏ qua: ${plan.skippedExisting.length + plan.skippedMissing.length}\n\n` +
-      `Truyện: ${state.selectedStory?.title || `#${state.selectedStoryId}`}\n\n` +
-      `Tiếp tục?`;
-
-    if (!confirm(confirmText)) return;
-
-    state.running = true;
-    state.cancelled = false;
-    renderRunState();
-
-    try {
-      let updateDone = 0;
-      let createDone = 0;
-
-      // 1) Update chapter đã có bằng rolling pool.
-      if (plan.updates.length) {
-        setStatus(`Đang cập nhật 0/${plan.updates.length} chương...`);
-
-        const results = await runPool(
-          plan.updates,
-          CFG.writeConcurrency,
-          async target => {
-            if (state.cancelled) throw new Error('Đã hủy.');
-
-            await updateChapter(
-              target.ch,
-              target.overrides,
-              `SYNC UPDATE Chương ${target.no}`
-            );
-
-            updateDone++;
-            setStatus(
-              `Đang cập nhật ${updateDone}/${plan.updates.length} chương...`
-            );
-
-            const changed = [];
-            if ('content' in target.overrides) changed.push('nội dung');
-            if ('title' in target.overrides) changed.push('tên');
-            if ('password' in target.overrides) changed.push('pass H');
-
-            addLog(
-              `SYNC UPDATE OK Chương ${target.no}: ${changed.join(' + ')}.`
-            );
-
-            const delay = clamp(
-              Number($('#ytlcc-bulk-delay')?.value || CFG.writeGapMs),
-              180,
-              5000
-            );
-            await sleep(delay);
-
-            return target.no;
-          }
-        );
-
-        const failedUpdates = plan.updates.filter((_, i) => !results[i]?.ok);
-        if (failedUpdates.length) {
-          for (const target of failedUpdates) {
-            const idx = plan.updates.indexOf(target);
-            addLog(
-              `SYNC UPDATE FAIL Chương ${target.no}: ` +
-              `${results[idx]?.error?.message || 'unknown'}`,
-              'error'
-            );
-          }
-
-          throw new Error(
-            `${failedUpdates.length}/${plan.updates.length} chương cập nhật thất bại. Dừng trước bước đăng mới.`
-          );
-        }
-      }
-
-      // 2) Missing chapter: create tuần tự.
-      // CREATE ưu tiên an toàn hơn tốc độ để tránh race chapter_number.
-      if (plan.creates.length) {
-        for (const target of plan.creates) {
-          if (state.cancelled) throw new Error('Đã hủy.');
-
-          setStatus(
-            `Đang đăng chương mới ${createDone + 1}/${plan.creates.length}: Chương ${target.no}...`
-          );
-
-          await createChapter(target.item);
-
-          createDone++;
-          addLog(
-            `SYNC CREATE OK Chương ${target.no} (${createDone}/${plan.creates.length}).`
-          );
-
-          const delay = clamp(
-            Number($('#ytlcc-bulk-delay')?.value || CFG.writeGapMs),
-            180,
-            5000
-          );
-          await sleep(delay);
-        }
-      }
-
-      // 3) Verify toàn bộ phần đã tác động bằng snapshot mới.
-      setStatus('Đã ghi xong. Đang verify toàn bộ...');
-      await sleep(450);
-
-      const verify = await verifySmartSync(plan);
-
-      if (!verify.ok) {
-        const detail = verify.failed
-          .map(x => `${x.no} (${x.type})`)
-          .join(', ');
-
-        throw new Error(`VERIFY thất bại: ${detail}`);
-      }
-
-      const msg =
-        `SYNC PASS. Cập nhật ${plan.updates.length}, ` +
-        `đăng mới ${plan.creates.length}, ` +
-        `giữ nguyên ${plan.unchanged.length}.`;
-
-      setStatus(msg, 'success');
-      toast(msg, 'success', 6000);
-      addLog(msg, 'success');
-    } finally {
-      state.running = false;
-      renderRunState();
-    }
-  }
-
-  // ============================================================
-  // BULK CREATE
-  // ============================================================
-
-  async function preflightNativeBulk() {
-    const storyId = Number(state.selectedStoryId);
-    if (!storyId) throw new Error('Chưa chọn truyện.');
-
-    const { html, doc, finalUrl } = await getDoc(
-      route(`/profile/stories/${storyId}/import-word`),
-      `GET preflight import-word #${storyId}`
-    );
-
-    if (!finalUrl.startsWith(ORIGIN)) {
-      throw new Error('Trang Import Word redirect ngoài domain.');
-    }
-
-    if (!csrfFrom(doc)) {
-      throw new Error('Trang Import Word không có CSRF token.');
-    }
-
-    if (!html.includes('import-word-commit')) {
-      throw new Error(
-        'Native Import Word đã đổi: không còn thấy route import-word-commit.'
-      );
-    }
-
-    return {
-      endpoint: route(`/profile/stories/${storyId}/import-word-commit`),
-    };
-  }
-
-  async function bulkCreate() {
-    const items = state.bulk.parsed;
-    if (!items.length) throw new Error('Chưa parse batch.');
-
-    await loadChapters();
-
-    if (!ensureContiguous(items)) {
-      throw new Error('Bulk create yêu cầu số chương liên tục.');
-    }
-
-    const maxExisting = state.chapters.length
-      ? Math.max(...state.chapters.map(x => Number(x.chapter_number) || 0))
-      : 0;
-
-    const expectedFirst = maxExisting + 1;
-    if (Number(items[0].chapterNo) !== expectedFirst) {
-      throw new Error(
-        `Bulk create native chỉ append. Chương đầu batch phải là ${expectedFirst}, nhưng hiện là ${items[0].chapterNo}.`
-      );
-    }
-
-    if (
-      !confirm(
-        `BULK CREATE ${items.length} chương cho "${state.selectedStory?.title || state.selectedStoryId}"?\n\n` +
-        `Server hiện có đến Chương ${maxExisting}.\n` +
-        `Batch sẽ append Chương ${items[0].chapterNo} → ${items.at(-1).chapterNo}.\n\n` +
-        `Tiếp tục?`
-      )
-    ) return;
-
-    const { endpoint } = await preflightNativeBulk();
-
-    state.running = true;
-    state.cancelled = false;
-    renderRunState();
-
-    try {
-      const chunks = [];
-      for (let i = 0; i < items.length; i += CFG.createChunkSize) {
-        chunks.push(items.slice(i, i + CFG.createChunkSize));
-      }
-
-      let done = 0;
-
-      for (const chunk of chunks) {
-        if (state.cancelled) throw new Error('Đã hủy.');
-
-        const payload = {
-          chapters: chunk.map(item => ({
-            name: item.title,
-            content: item.contentHtml,
-            password: null,
-            stars_active: Math.max(0, Number($('#ytlcc-bulk-price')?.value || 0)),
-          })),
-          publish_type: 'now',
-          published_at: '',
-          schedule_interval_hours: 1,
-        };
-
-        setStatus(`Bulk create ${done + 1} → ${done + chunk.length}/${items.length}...`);
-
-        await postJson(
-          endpoint,
-          payload,
-          `BULK CREATE ${chunk[0].chapterNo}-${chunk.at(-1).chapterNo}`
-        );
-
-        done += chunk.length;
-        addLog(`Bulk create ACK: ${done}/${items.length}.`);
-
-        // Reconcile sau mỗi chunk, chống partial success.
-        await sleep(600);
-        const snap = await fetchChapterSnapshot();
-
-        const map = new Map(
-          snap.chapters.map(ch => [Number(ch.chapter_number), ch])
-        );
-
-        for (const expected of items.slice(0, done)) {
-          const actual = map.get(Number(expected.chapterNo));
-          if (!actual) {
-            throw new Error(
-              `Reconcile thất bại: chưa thấy Chương ${expected.chapterNo} sau commit.`
-            );
-          }
-        }
-
-        state.chapters = snap.chapters.sort(
-          (a, b) => a.chapter_number - b.chapter_number
-        );
-        state.chapterMap = map;
-        renderChapters();
-        renderBulkPreview();
-      }
-
-      toast(`Bulk create hoàn tất ${items.length} chương.`, 'success', 5000);
-      setStatus(`Bulk create hoàn tất ${items.length} chương.`, 'success');
-    } finally {
-      state.running = false;
-      renderRunState();
-    }
-  }
-
-  // ============================================================
-  // BULK UPDATE
-  // ============================================================
-
-  async function runPool(items, concurrency, worker) {
-    const results = new Array(items.length);
-    let cursor = 0;
-
-    async function runner(workerId) {
-      while (true) {
-        if (state.cancelled) return;
-        const i = cursor++;
-        if (i >= items.length) return;
-
-        try {
-          results[i] = {
-            ok: true,
-            value: await worker(items[i], i, workerId),
-          };
-        } catch (err) {
-          results[i] = {
-            ok: false,
-            error: err,
-          };
-        }
-      }
-    }
-
-    const n = Math.min(
-      Math.max(1, Number(concurrency || 1)),
-      items.length || 1
-    );
-
-    await Promise.all(Array.from({ length: n }, (_, i) => runner(i)));
-    return results;
-  }
-
-  function buildBulkUpdatePlan(mode) {
-    const parsed = state.bulk.parsed;
-    const targets = [];
-
-    if (mode === 'price' || mode === 'password') {
-      // Nếu có parsed, dùng range parsed. Nếu không, áp dụng toàn bộ chapter đang load.
-      const source = parsed.length
-        ? parsed.map(x => Number(x.chapterNo))
-        : state.chapters.map(x => Number(x.chapter_number));
-
-      for (const no of source) {
-        const ch = state.chapterMap.get(no);
-        if (!ch) {
-          throw new Error(`Không map được Chương ${no} trên server.`);
-        }
-
-        const overrides = {};
-        if (mode === 'price') {
-          overrides.stars_active = Math.max(
-            0,
-            Number($('#ytlcc-bulk-price')?.value || 0)
-          );
-        } else {
-          overrides.password = getHPassword();
-        }
-
-        targets.push({ no, ch, overrides });
-      }
-
-      return targets;
-    }
-
-    if (!parsed.length) {
-      throw new Error('Update nội dung/title cần parse batch trước.');
-    }
-
-    for (const item of parsed) {
-      const ch = state.chapterMap.get(Number(item.chapterNo));
-      if (!ch) {
-        throw new Error(`Không tìm thấy Chương ${item.chapterNo} trên server.`);
-      }
-
-      const overrides = {};
-      if (mode === 'content') overrides.content = item.contentHtml;
-      if (mode === 'title') overrides.title = item.title;
-      if (mode === 'content_title') {
-        overrides.content = item.contentHtml;
-        overrides.title = item.title;
-      }
-
-      targets.push({
-        no: Number(item.chapterNo),
-        ch,
-        item,
-        overrides,
-      });
-    }
-
-    return targets;
-  }
-
-  function matchesExpected(ch, overrides) {
-    if (!ch) return false;
-
-    if ('title' in overrides && String(ch.title || '') !== String(overrides.title || '')) {
-      return false;
-    }
-
-    if (
-      'stars_active' in overrides &&
-      Number(ch.stars_active || 0) !== Number(overrides.stars_active || 0)
-    ) {
-      return false;
-    }
-
-    if (
-      'password' in overrides &&
-      String(ch.password || '') !== String(overrides.password || '')
-    ) {
-      return false;
-    }
-
-    if ('content' in overrides) {
-      const a = normalizeHtml(ch.content || '');
-      const b = normalizeHtml(overrides.content || '');
-      if (a !== b) return false;
-    }
-
-    return true;
+  function countWordsFromHtml(html) {
+    const doc = new DOMParser().parseFromString(`<body>${html || ''}</body>`, 'text/html');
+    const words = text(doc.body.textContent).match(/\S+/g);
+    return words ? words.length : 0;
   }
 
   function normalizeHtml(html) {
-    const doc = new DOMParser().parseFromString(`<div>${html || ''}</div>`, 'text/html');
-    return (doc.body.firstElementChild?.innerHTML || '')
-      .replace(/\s+/g, ' ')
-      .replace(/>\s+</g, '><')
-      .trim();
+    return String(html || '').replace(/\r\n?/g, '\n').replace(/>\s+</g, '><').trim();
   }
 
-  async function verifyTargets(targets) {
-    let last = null;
+  function initializeExistingPricing(reset = false) {
+    // existingPricing vừa là snapshot ban đầu vừa là TARGET mà user đang chỉnh.
+    // Vì vậy refresh server/re-check KHÔNG được clear target đang chọn;
+    // chỉ reset khi user chủ động chuyển vào tác vụ Fix giá.
+    if (reset) state.bulk.existingPricing.clear();
 
-    for (let attempt = 1; attempt <= CFG.verifyAttempts; attempt++) {
-      if (state.cancelled) throw new Error('Đã hủy.');
+    for (const row of state.chapters) {
+      if (reset || !state.bulk.existingPricing.has(row.chapterNo)) {
+        state.bulk.existingPricing.set(row.chapterNo, rowToPricing(row));
+      }
+    }
+  }
 
-      const snap = await fetchChapterSnapshot();
-      const map = new Map(
-        snap.chapters.map(ch => [Number(ch.chapter_number), ch])
-      );
+  function rowToPricing(row) {
+    if (!row) return { type: 'free', value: 0 };
+    if (row.wordCount > 0 && row.wordCount < CFG.pricing.minPaidWords) return { type: 'free', value: 0 };
+    if (Number(row.diamonds) > 0) return { type: 'diamond', value: 1 };
+    if (Number(row.stars) > 0) return { type: 'stars', value: clamp(Number(row.stars), 1, CFG.pricing.maxStars) };
+    return { type: 'free', value: 0 };
+  }
 
-      const failed = targets.filter(t => {
-        const actual = map.get(Number(t.no));
-        return !matchesExpected(actual, t.overrides);
-      });
+  function normalizePricing(p) {
+    if (p?.type === 'stars') return { type: 'stars', value: clamp(Math.floor(Number(p.value) || 1), 1, CFG.pricing.maxStars) };
+    if (p?.type === 'diamond') return { type: 'diamond', value: 1 };
+    return { type: 'free', value: 0 };
+  }
 
-      if (!failed.length) {
-        state.chapters = snap.chapters.sort(
-          (a, b) => a.chapter_number - b.chapter_number
-        );
-        state.chapterMap = map;
-        renderChapters();
-        renderBulkPreview();
-        return { ok: true, failed: [] };
+  function bulkOperation() {
+    return $('#ttlcc-bulk-operation')?.value || state.bulk.operation || 'price_update';
+  }
+
+  function bulkItemWordCount(no) {
+    const parsed = state.bulk.parsed.find(x => x.chapterNo === Number(no));
+    if (parsed) return countWordsFromHtml(parsed.htmlContent);
+    return Number(state.chapterMap.get(Number(no))?.wordCount || 0);
+  }
+
+  function pricingLocked(no) {
+    const words = bulkItemWordCount(no);
+    return words > 0 && words < CFG.pricing.minPaidWords;
+  }
+
+  function activePriceMap() {
+    return bulkOperation() === 'price_update'
+      ? state.bulk.existingPricing
+      : state.bulk.pricing;
+  }
+
+  function getPricing(no) {
+    no = Number(no);
+    const map = activePriceMap();
+    if (pricingLocked(no)) {
+      const p = { type: 'free', value: 0 };
+      map.set(no, p);
+      return p;
+    }
+    if (!map.has(no)) {
+      map.set(no, bulkOperation() === 'price_update' ? rowToPricing(state.chapterMap.get(no)) : { type: 'free', value: 0 });
+    }
+    return normalizePricing(map.get(no));
+  }
+
+  function setPricing(no, type, value = 0) {
+    no = Number(no);
+    const map = activePriceMap();
+    const p = pricingLocked(no) ? { type: 'free', value: 0 } : normalizePricing({ type, value });
+    map.set(no, p);
+    return p;
+  }
+
+  function pricingFields(p, no) {
+    if (pricingLocked(no)) return { stars_active: '0', diamonds_active: '0' };
+    p = normalizePricing(p);
+    if (p.type === 'stars') return { stars_active: String(p.value), diamonds_active: '0' };
+    if (p.type === 'diamond') return { stars_active: '0', diamonds_active: '1' };
+    return { stars_active: '0', diamonds_active: '0' };
+  }
+
+  function pricingLabel(p) {
+    p = normalizePricing(p);
+    if (p.type === 'stars') return `${p.value} sao`;
+    if (p.type === 'diamond') return '1 KC';
+    return 'FREE';
+  }
+
+  function priceMatchesRow(p, row) {
+    p = normalizePricing(p);
+    const stars = Number(row?.stars || 0);
+    const diamonds = Number(row?.diamonds || 0);
+    if (p.type === 'stars') return stars === p.value && diamonds === 0;
+    if (p.type === 'diamond') return stars === 0 && diamonds === 1;
+    return stars === 0 && diamonds === 0;
+  }
+
+  function selectedBulkItems() {
+    const from = Number($('#ttlcc-bulk-from')?.value || 0);
+    const to = Number($('#ttlcc-bulk-to')?.value || Number.MAX_SAFE_INTEGER);
+    const op = bulkOperation();
+
+    if (op === 'price_update') {
+      return state.chapters
+        .filter(r => r.chapterNo >= from && r.chapterNo <= to)
+        .map(r => ({
+          chapterNo: r.chapterNo,
+          title: r.title,
+          htmlContent: '',
+          wordCount: r.wordCount,
+        }));
+    }
+
+    return state.bulk.parsed.filter(x => x.chapterNo >= from && x.chapterNo <= to);
+  }
+
+  function applyPricingRange() {
+    const from = Number($('#ttlcc-price-from').value);
+    const to = Number($('#ttlcc-price-to').value);
+    const type = $('#ttlcc-price-type').value;
+    const value = Number($('#ttlcc-price-value').value || 0);
+
+    if (!Number.isInteger(from) || !Number.isInteger(to)) return toast('Phạm vi giá không hợp lệ.', 'warn');
+    const lo = Math.min(from, to);
+    const hi = Math.max(from, to);
+    let count = 0;
+
+    for (const item of selectedBulkItems()) {
+      if (item.chapterNo < lo || item.chapterNo > hi) continue;
+      setPricing(item.chapterNo, type, value);
+      count++;
+    }
+
+    toast(`Đã áp giá cho ${count} chương trong dải ${lo}-${hi}.`, 'ok');
+    renderBulkPreview();
+  }
+
+  function applyAlternating(first = 'stars') {
+    const from = Number($('#ttlcc-price-from').value || $('#ttlcc-bulk-from').value);
+    const to = Number($('#ttlcc-price-to').value || $('#ttlcc-bulk-to').value);
+    const star = clamp(Number($('#ttlcc-price-value').value || 5), 1, CFG.pricing.maxStars);
+    const items = selectedBulkItems().filter(x => x.chapterNo >= Math.min(from, to) && x.chapterNo <= Math.max(from, to));
+    let idx = 0;
+    for (const item of items) {
+      if (pricingLocked(item.chapterNo)) {
+        setPricing(item.chapterNo, 'free');
+        continue;
+      }
+      const type = idx % 2 === 0 ? first : (first === 'stars' ? 'diamond' : 'stars');
+      setPricing(item.chapterNo, type, type === 'stars' ? star : 1);
+      idx++;
+    }
+    renderBulkPreview();
+  }
+
+  function renderBulkPreview() {
+    const body = $('#ttlcc-bulk-preview');
+    if (!body) return;
+    body.innerHTML = '';
+
+    const op = bulkOperation();
+    const items = selectedBulkItems();
+    const maxExisting = state.chapters.length ? Math.max(...state.chapters.map(x => x.chapterNo)) : 0;
+    let changed = 0;
+
+    for (const item of items.slice(0, CFG.maxPreviewRows)) {
+      const row = state.chapterMap.get(item.chapterNo);
+      const p = getPricing(item.chapterNo);
+      let status = '';
+
+      if (op === 'price_update') {
+        const diff = row && !priceMatchesRow(p, row);
+        if (diff) changed++;
+        status = !row ? 'KHÔNG THẤY' : diff ? 'SẼ SỬA GIÁ' : 'KHÔNG ĐỔI';
+      } else if (op === 'create') {
+        status = row || item.chapterNo <= maxExisting ? 'ĐÃ TỒN TẠI' : 'SẼ ĐĂNG';
+      } else {
+        status = row ? 'SẼ CẬP NHẬT' : 'THIẾU TRÊN WEB';
       }
 
-      last = failed;
+      const canPrice = ['price_update', 'create'].includes(op);
+      const locked = pricingLocked(item.chapterNo);
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${item.chapterNo}</td>
+        <td class="ttlcc-left">${esc(item.title || row?.title || '')}</td>
+        <td>${op === 'price_update' ? Number(row?.wordCount || 0).toLocaleString() : countWordsFromHtml(item.htmlContent).toLocaleString()}</td>
+        <td>
+          ${canPrice ? (
+            locked
+              ? '<span class="ttlcc-price-lock">FREE · &lt;1000 từ</span>'
+              : `<div class="ttlcc-inline-price">
+                   <select data-price-type="${item.chapterNo}">
+                     <option value="free" ${p.type === 'free' ? 'selected' : ''}>FREE</option>
+                     <option value="stars" ${p.type === 'stars' ? 'selected' : ''}>Sao</option>
+                     <option value="diamond" ${p.type === 'diamond' ? 'selected' : ''}>KC</option>
+                   </select>
+                   <input data-price-value="${item.chapterNo}" type="number" min="1" max="10" value="${p.type === 'stars' ? p.value : p.type === 'diamond' ? 1 : ''}" ${p.type === 'stars' ? '' : 'disabled'}>
+                 </div>`
+          ) : '—'}
+        </td>
+        <td><span class="ttlcc-state ${/SẼ/.test(status) ? 'pending' : /KHÔNG ĐỔI/.test(status) ? 'ok' : /THIẾU|ĐÃ TỒN TẠI/.test(status) ? 'bad' : ''}">${esc(status)}</span></td>
+      `;
+      body.appendChild(tr);
+    }
 
-      if (attempt < CFG.verifyAttempts) {
-        addLog(
-          `VERIFY ${attempt}/${CFG.verifyAttempts}: còn ${failed.length} chương chưa khớp, retry...`,
-          'warn'
-        );
-        await sleep(CFG.verifyDelayMs * attempt);
+    body.querySelectorAll('[data-price-type]').forEach(sel => {
+      sel.onchange = () => {
+        const no = Number(sel.dataset.priceType);
+        const input = body.querySelector(`[data-price-value="${no}"]`);
+        const p = setPricing(no, sel.value, Number(input?.value || 1));
+        if (input) {
+          input.disabled = p.type !== 'stars';
+          input.value = p.type === 'stars' ? p.value : p.type === 'diamond' ? 1 : '';
+        }
+        renderBulkPreview();
+      };
+    });
+
+    body.querySelectorAll('[data-price-value]').forEach(inp => {
+      inp.onchange = () => {
+        const no = Number(inp.dataset.priceValue);
+        setPricing(no, 'stars', Number(inp.value));
+        renderBulkPreview();
+      };
+    });
+
+    const summary = $('#ttlcc-bulk-summary');
+    if (summary) {
+      const missing = items.filter(x => !state.chapterMap.has(x.chapterNo)).length;
+      summary.textContent = op === 'price_update'
+        ? `${items.length} chương trong phạm vi · ${changed} chương sẽ đổi giá`
+        : op === 'create'
+          ? `${items.length} chương từ TXT · chương cuối web: ${maxExisting}`
+          : `${items.length} chương từ TXT · thiếu trên web: ${missing}`;
+    }
+  }
+
+  async function fetchChapterSnapshot(row, fresh = false) {
+    if (!fresh && state.snapshotCache.has(row.chapterId)) return state.snapshotCache.get(row.chapterId);
+    const { doc, finalUrl } = await fetchDoc(row.editUrl, `GET snapshot CHƯƠNG ${row.chapterNo}`);
+    const form = findChapterForm(doc, 'edit');
+    if (!form) throw new Error('Không tìm thấy form update chương.');
+    const model = formToModel(form, finalUrl);
+    const snap = {
+      row,
+      model,
+      currentName: modelValue(model, 'name_chapter'),
+      currentContent: modelValue(model, 'content_chapter'),
+      currentStars: Number(modelValue(model, 'stars_active') || 0),
+      currentDiamonds: Number(modelValue(model, 'diamonds_active') || 0),
+    };
+    state.snapshotCache.set(row.chapterId, snap);
+    return snap;
+  }
+
+  async function submitChapterOverrides(snapshot, overrides, label) {
+    const params = modelToParams(snapshot.model, overrides);
+    return postOnce(snapshot.model.action, {
+      rawMethod: snapshot.model.rawMethod || 'POST',
+      body: params.toString(),
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+      label,
+    });
+  }
+
+  async function verifyChapter(row, expected) {
+    const snap = await fetchChapterSnapshot(row, true);
+    if (expected.name !== undefined && snap.currentName !== expected.name) {
+      throw new Error(`Tên không khớp sau lưu: web="${snap.currentName}" cần="${expected.name}"`);
+    }
+    if (expected.content !== undefined && normalizeHtml(snap.currentContent) !== normalizeHtml(expected.content)) {
+      throw new Error('Nội dung không khớp sau lưu.');
+    }
+    if (expected.stars !== undefined && Number(snap.currentStars) !== Number(expected.stars)) {
+      throw new Error(`Sao không khớp sau lưu: web=${snap.currentStars} cần=${expected.stars}`);
+    }
+    if (expected.diamonds !== undefined && Number(snap.currentDiamonds) !== Number(expected.diamonds)) {
+      throw new Error(`KC không khớp sau lưu: web=${snap.currentDiamonds} cần=${expected.diamonds}`);
+    }
+    return true;
+  }
+
+  async function getCreateChapterModel() {
+    if (state.chapterCreateModel && Number(modelValue(state.chapterCreateModel, 'post_id')) === Number(state.selectedStoryId)) {
+      return state.chapterCreateModel;
+    }
+    const { doc, finalUrl } = await fetchDoc(routeUrl(`/createchapter/${state.selectedStoryId}`), 'GET template tạo chương');
+    const form = findChapterForm(doc, 'create');
+    if (!form) throw new Error('Không tìm thấy form POST /chapter.');
+    state.chapterCreateModel = formToModel(form, finalUrl);
+    return state.chapterCreateModel;
+  }
+
+  async function runBulk() {
+    if (state.running) return;
+    if (!state.selectedStoryId) return toast('Chưa chọn truyện.', 'warn');
+
+    const op = bulkOperation();
+    state.bulk.operation = op;
+
+    if (op === 'price_update') {
+      // Refresh server trước khi chạy nhưng GIỮ nguyên target giá user vừa chọn.
+      await loadChapters();
+      initializeExistingPricing(false);
+    } else if (op === 'create') {
+      // Một refresh trước validation là đủ. Sau mỗi POST, loadChapters()
+      // bên dưới vừa re-check vừa tạo snapshot mới cho vòng kế tiếp.
+      await loadChapters();
+    }
+
+    let items = selectedBulkItems();
+    if (!items.length) return toast('Không có chương trong phạm vi.', 'warn');
+
+    if (op === 'price_update') {
+      items = items.filter(x => {
+        const row = state.chapterMap.get(x.chapterNo);
+        return row && !priceMatchesRow(getPricing(x.chapterNo), row);
+      });
+      if (!items.length) return toast('Không có chương nào thay đổi giá.', 'warn');
+    }
+
+    if (op !== 'price_update' && !state.bulk.parsed.length) {
+      return toast('Cần nạp/parse TXT trước.', 'warn');
+    }
+
+    if (op !== 'create') {
+      const missing = items.filter(x => !state.chapterMap.has(x.chapterNo));
+      if (missing.length) return toast(`Thiếu trên web: ${missing.map(x => x.chapterNo).join(', ')}`, 'error', 6000);
+    }
+
+    if (op === 'create') {
+      const maxExisting = state.chapters.length ? Math.max(...state.chapters.map(x => x.chapterNo)) : 0;
+      const sorted = [...items].sort((a, b) => a.chapterNo - b.chapterNo);
+      if (sorted[0].chapterNo !== maxExisting + 1) {
+        return toast(`Đăng mới phải bắt đầu từ CHƯƠNG ${maxExisting + 1}.`, 'error', 6000);
+      }
+      for (let i = 0; i < sorted.length; i++) {
+        if (sorted[i].chapterNo !== maxExisting + 1 + i) {
+          return toast(`Dải đăng mới không liên tục tại CHƯƠNG ${sorted[i].chapterNo}.`, 'error', 6000);
+        }
       }
     }
 
-    return { ok: false, failed: last || targets };
-  }
+    const labels = {
+      price_update: 'FIX GIÁ CHƯƠNG CŨ',
+      both: 'CẬP NHẬT TÊN + NỘI DUNG',
+      title: 'CHỈ ĐỔI TÊN',
+      content: 'CHỈ CẬP NHẬT NỘI DUNG',
+      create: 'ĐĂNG CHƯƠNG MỚI',
+    };
 
-  async function bulkUpdate(mode) {
-    await loadChapters();
-    const targets = buildBulkUpdatePlan(mode);
-
-    if (!targets.length) throw new Error('Không có chương cần update.');
-
-    const modeLabel = {
-      content: 'nội dung',
-      title: 'tiêu đề',
-      content_title: 'nội dung + tiêu đề',
-      price: 'giá Kim Cương',
-      password: 'mật khẩu',
-    }[mode] || mode;
-
-    if (
-      !confirm(
-        `BULK UPDATE ${modeLabel} cho ${targets.length} chương?\n\n` +
-        `Rolling write concurrency = ${CFG.writeConcurrency}.\n` +
-        `Sau ghi sẽ GET toàn danh sách để verify.`
-      )
-    ) return;
+    if (!confirm(`${labels[op]}\n\nTruyện #${state.selectedStoryId}\nSố chương: ${items.length}\n\nĐây là thao tác thật lên server. Tiếp tục?`)) return;
 
     state.running = true;
     state.cancelled = false;
-    renderRunState();
+    const runBtn = $('#ttlcc-bulk-run');
+    const cancelBtn = $('#ttlcc-bulk-cancel');
+    if (runBtn) runBtn.disabled = true;
+    if (cancelBtn) cancelBtn.disabled = false;
+
+    const verify = $('#ttlcc-bulk-verify')?.checked ?? true;
+    const stopError = $('#ttlcc-bulk-stop-error')?.checked ?? true;
+    const delayMs = Math.max(0, Number($('#ttlcc-bulk-delay')?.value || 1000));
+    let ok = 0;
+    let errors = 0;
 
     try {
-      let completed = 0;
-      setStatus(`Đang update ${targets.length} chương...`);
+      let createModel = null;
+      if (op === 'create') createModel = await getCreateChapterModel();
 
-      const results = await runPool(
-        targets,
-        CFG.writeConcurrency,
-        async target => {
-          if (state.cancelled) throw new Error('Đã hủy.');
-
-          await updateChapter(
-            target.ch,
-            target.overrides,
-            `UPDATE Chương ${target.no}`
-          );
-
-          completed++;
-          setStatus(`Đã ghi ${completed}/${targets.length} chương...`);
-          addLog(`WRITE OK Chương ${target.no} (${completed}/${targets.length}).`);
-
-          const delay = clamp(
-            Number($('#ytlcc-bulk-delay')?.value || CFG.writeGapMs),
-            180,
-            5000
-          );
-          await sleep(delay);
-
-          return target.no;
-        }
-      );
-
-      const failedWrites = targets.filter((_, i) => !results[i]?.ok);
-
-      if (failedWrites.length) {
-        for (const t of failedWrites) {
-          const idx = targets.indexOf(t);
-          addLog(
-            `WRITE FAIL Chương ${t.no}: ${results[idx]?.error?.message || 'unknown'}`,
-            'error'
-          );
+      for (let i = 0; i < items.length; i++) {
+        if (state.cancelled) {
+          addLog('Bulk: đã hủy trước request kế tiếp.', 'warn');
+          break;
         }
 
-        throw new Error(
-          `${failedWrites.length}/${targets.length} chương ghi thất bại. Dừng trước VERIFY toàn batch.`
-        );
+        const item = items[i];
+        setStatus(`${labels[op]} ${i + 1}/${items.length}: CHƯƠNG ${item.chapterNo}`);
+
+        try {
+          if (op === 'create') {
+            // state.chapters luôn là snapshot mới nhất: refresh trước batch
+            // hoặc re-check sau POST của chương trước.
+            const maxNow = state.chapters.length ? Math.max(...state.chapters.map(x => x.chapterNo)) : 0;
+            if (item.chapterNo !== maxNow + 1) {
+              const exists = state.chapterMap.get(item.chapterNo);
+              if (exists && sanitizeChapterTitle(exists.title, null) === sanitizeChapterTitle(item.title, item.chapterNo)) {
+                addLog(`Bỏ qua CHƯƠNG ${item.chapterNo}: đã tồn tại đúng tên.`, 'warn');
+                ok++;
+                continue;
+              }
+              throw new Error(`Thứ tự server đổi: chương cuối=${maxNow}, đang chuẩn bị=${item.chapterNo}`);
+            }
+
+            const price = pricingFields(getPricing(item.chapterNo), item.chapterNo);
+            const params = modelToParams(createModel, {
+              name_chapter: sanitizeChapterTitle(item.title, item.chapterNo),
+              content_chapter: item.htmlContent,
+              word_count2: String(countWordsFromHtml(item.htmlContent)),
+              post_id: String(state.selectedStoryId),
+              publish_mode: 'now',
+              publish_at: '',
+              stars_active: price.stars_active,
+              diamonds_active: price.diamonds_active,
+            });
+
+            let postError = null;
+            try {
+              await postOnce(createModel.action, {
+                rawMethod: createModel.rawMethod || 'POST',
+                body: params.toString(),
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                label: `POST CHƯƠNG ${item.chapterNo}`,
+              });
+            } catch (err) {
+              postError = err;
+              addLog(`POST CHƯƠNG ${item.chapterNo} bất định: ${err.message}; đang xác minh server…`, 'warn');
+            }
+
+            await sleep(500);
+            await loadChapters();
+            const row = state.chapterMap.get(item.chapterNo);
+            if (!row) throw postError || new Error('POST trả về nhưng chương chưa xuất hiện.');
+            if (sanitizeChapterTitle(row.title, null) !== sanitizeChapterTitle(item.title, item.chapterNo)) {
+              throw new Error(`Chương xuất hiện nhưng tên không khớp: web="${row.title}"`);
+            }
+            const targetP = getPricing(item.chapterNo);
+            if (!priceMatchesRow(targetP, row)) {
+              throw new Error(`Giá sau tạo không khớp: web=${row.stars} sao/${row.diamonds} KC, cần=${pricingLabel(targetP)}`);
+            }
+          } else {
+            const row = state.chapterMap.get(item.chapterNo);
+            const snap = await fetchChapterSnapshot(row, op === 'price_update');
+            const overrides = {};
+            const expected = {};
+
+            if (op === 'both' || op === 'title') {
+              overrides.name_chapter = sanitizeChapterTitle(item.title, item.chapterNo);
+              expected.name = overrides.name_chapter;
+            }
+            if (op === 'both' || op === 'content') {
+              overrides.content_chapter = item.htmlContent;
+              overrides.word_count2 = String(countWordsFromHtml(item.htmlContent));
+              expected.content = item.htmlContent;
+            }
+            if (op === 'price_update') {
+              const pf = pricingFields(getPricing(item.chapterNo), item.chapterNo);
+              overrides.stars_active = pf.stars_active;
+              overrides.diamonds_active = pf.diamonds_active;
+              expected.stars = Number(pf.stars_active || 0);
+              expected.diamonds = Number(pf.diamonds_active || 0);
+            }
+
+            await submitChapterOverrides(snap, overrides, `UPDATE CHƯƠNG ${item.chapterNo}`);
+            if (verify) {
+              await sleep(350 + jitter(180));
+              await verifyChapter(row, expected);
+            }
+          }
+
+          ok++;
+          addLog(`${labels[op]} OK: CHƯƠNG ${item.chapterNo}`, 'ok');
+        } catch (err) {
+          errors++;
+          addLog(`${labels[op]} LỖI CHƯƠNG ${item.chapterNo}: ${err.message}`, 'error');
+          if (stopError) throw err;
+        }
+
+        if (i + 1 < items.length) {
+          if ((i + 1) % CFG.bulkCooldownEvery === 0) {
+            await sleep(CFG.bulkCooldownMs);
+          } else if (delayMs) {
+            await sleep(delayMs + jitter(220));
+          }
+        }
       }
 
-      setStatus('Đã ghi xong. Đang verify...');
-      await sleep(500);
-
-      const verify = await verifyTargets(targets);
-      if (!verify.ok) {
-        const nums = verify.failed.map(x => x.no).join(', ');
-        throw new Error(`VERIFY thất bại ở chương: ${nums}`);
-      }
-
-      toast(`Bulk update ${modeLabel} PASS ${targets.length}/${targets.length}.`, 'success', 5200);
-      setStatus(`PASS ${targets.length}/${targets.length}.`, 'success');
+      await loadChapters();
+      setStatus(`Bulk hoàn tất: thành công ${ok}, lỗi ${errors}.`, errors ? 'warn' : 'ok');
+      toast(`Bulk hoàn tất: ${ok} OK / ${errors} lỗi.`, errors ? 'warn' : 'ok', 5000);
+    } catch (err) {
+      setStatus(`Bulk dừng: ${err.message}`, 'error');
+      toast(`Bulk dừng: ${err.message}`, 'error', 6500);
     } finally {
       state.running = false;
-      renderRunState();
+      if (runBtn) runBtn.disabled = false;
+      if (cancelBtn) cancelBtn.disabled = true;
+      renderBulkPreview();
     }
   }
 
-  // ============================================================
-  // STATS - ALL STORIES
-  // ============================================================
+  // ==========================================================
+  // DASHBOARD / NATIVE TOOLS
+  // ==========================================================
 
-  function emptyStatsSummary() {
+  function renderDashboard() {
+    const story = state.selectedStory;
+    const chapters = state.chapters;
+    const paidStars = chapters.filter(x => x.stars > 0).length;
+    const paidDiamonds = chapters.filter(x => x.diamonds > 0).length;
+    const free = chapters.filter(x => x.stars <= 0 && x.diamonds <= 0).length;
+    const shortPaid = chapters.filter(x => x.wordCount > 0 && x.wordCount < CFG.pricing.minPaidWords && (x.stars > 0 || x.diamonds > 0)).length;
+
+    const set = (id, value) => { const el = $(id); if (el) el.textContent = value; };
+    set('#ttlcc-stat-story', story ? story.title : '—');
+    set('#ttlcc-stat-chapters', chapters.length.toLocaleString());
+    set('#ttlcc-stat-free', free.toLocaleString());
+    set('#ttlcc-stat-stars', paidStars.toLocaleString());
+    set('#ttlcc-stat-diamonds', paidDiamonds.toLocaleString());
+    set('#ttlcc-stat-shortpaid', shortPaid.toLocaleString());
+
+    const warn = $('#ttlcc-dashboard-warning');
+    if (warn) {
+      warn.style.display = shortPaid ? '' : 'none';
+      warn.textContent = shortPaid
+        ? `Phát hiện ${shortPaid} CHƯƠNG dưới 1000 từ nhưng vẫn đang trả phí. Có thể sửa ngay ở tab Bulk → Fix giá.`
+        : '';
+    }
+  }
+
+  function parseLooseNumber(value) {
+    const raw = String(value ?? '')
+      .replace(/\u00A0/g, ' ')
+      .trim();
+
+    const m = raw.match(/-?\d[\d.,]*/);
+    if (!m) return null;
+
+    // Các số trên site chủ yếu là số nguyên; bỏ separator ngàn.
+    const digits = m[0].replace(/[^\d-]/g, '');
+    const n = Number(digits);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function formatKC(value) {
+    const n = Number(value);
+    return Number.isFinite(n)
+      ? `${n.toLocaleString('vi-VN')} KC`
+      : '—';
+  }
+
+  function formatVnd(value) {
+    const n = Number(value);
+    return Number.isFinite(n)
+      ? `${n.toLocaleString('vi-VN')} ₫`
+      : '—';
+  }
+
+  function findMetricContainer(doc, label) {
+    const target = norm(label);
+    let best = null;
+    let bestScore = -Infinity;
+
+    for (const el of doc.body?.querySelectorAll('*') || []) {
+      const own = norm(el.textContent);
+      if (!own.includes(target)) continue;
+
+      let node = el;
+
+      for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+        const raw = text(node.textContent);
+        const n = norm(raw);
+        if (!n.includes(target)) continue;
+
+        let score = 0;
+        const cls = String(node.className || '').toLowerCase();
+
+        if (
+          /info-box|small-box|card|stat|summary/.test(cls)
+        ) {
+          score += 100;
+        }
+
+        if (/\d/.test(raw)) score += 35;
+        if (/kim\s*cương/i.test(raw)) score += 30;
+        if (raw.length <= 180) score += 25;
+        if (raw.length > 500) score -= 80;
+
+        if (score > bestScore) {
+          bestScore = score;
+          best = node;
+        }
+      }
+    }
+
+    return best;
+  }
+
+  function metricNumber(doc, label) {
+    const container = findMetricContainer(doc, label);
+    if (!container) return null;
+
+    const target = norm(label);
+    const candidates = [];
+
+    for (const el of container.querySelectorAll('*')) {
+      const raw = text(el.textContent);
+      if (!raw || !/\d/.test(raw)) continue;
+      if (norm(raw).includes(target)) continue;
+      if (/r[uú]t ti[eề]n/i.test(raw)) continue;
+      if (raw.length > 90) continue;
+
+      let score = 0;
+      const cls = String(el.className || '').toLowerCase();
+      const tag = String(el.tagName || '').toLowerCase();
+
+      if (/number|value|amount|info-box-number/.test(cls)) score += 90;
+      if (['strong', 'b', 'h2', 'h3', 'h4'].includes(tag)) score += 50;
+      if (el.children.length === 0) score += 25;
+      if (/kim\s*cương/i.test(raw)) score += 35;
+      if (/^\d[\d.,]*(?:\s*kim\s*cương)?$/i.test(raw)) score += 60;
+
+      candidates.push({
+        raw,
+        value: parseLooseNumber(raw),
+        score,
+      });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+
+    const hit = candidates.find(x => x.value !== null);
+    if (hit) return hit.value;
+
+    return parseLooseNumber(container.textContent);
+  }
+
+  function revenuePeriod(doc) {
+    const from = doc.querySelector(
+      'select[name="from_month"] option:checked'
+    );
+    const to = doc.querySelector(
+      'select[name="to_month"] option:checked'
+    );
+
+    if (!from && !to) return '';
+
+    const a = text(from?.textContent || from?.value || '');
+    const b = text(to?.textContent || to?.value || '');
+
+    if (a && b) return a === b ? a : `${a} → ${b}`;
+    return a || b;
+  }
+
+  function headerIndex(table, regex) {
+    const headers = [
+      ...table.querySelectorAll('thead th'),
+    ].map((th, index) => ({
+      index,
+      text: norm(th.textContent),
+    }));
+
+    return headers.find(x => regex.test(x.text))?.index ?? -1;
+  }
+
+  function aggregateStoryRevenueTable(table) {
+    if (!table) return [];
+
+    const nameIx = headerIndex(
+      table,
+      /ten truyen|^truyen$/
+    );
+    const salesIx = headerIndex(
+      table,
+      /so luot mua|luot mua|luot ban/
+    );
+    const revenueIx = headerIndex(
+      table,
+      /doanh thu.*kim cuong/
+    );
+
+    if (nameIx < 0 || revenueIx < 0) return [];
+
+    const map = new Map();
+
+    for (const tr of table.querySelectorAll('tbody tr')) {
+      const cells = [...tr.querySelectorAll('td')];
+      if (!cells.length) continue;
+
+      const title = text(cells[nameIx]?.textContent);
+      if (
+        !title ||
+        /dang tai|khong co du lieu/i.test(norm(title))
+      ) {
+        continue;
+      }
+
+      const sales =
+        salesIx >= 0
+          ? (parseLooseNumber(cells[salesIx]?.textContent) || 0)
+          : 0;
+
+      const kc =
+        parseLooseNumber(cells[revenueIx]?.textContent) || 0;
+
+      const prev = map.get(title) || {
+        title,
+        sales: 0,
+        kc: 0,
+      };
+
+      prev.sales += sales;
+      prev.kc += kc;
+      map.set(title, prev);
+    }
+
+    return [...map.values()];
+  }
+
+  function aggregateRevenueHistory(table) {
+    if (!table) return [];
+
+    const storyIx = headerIndex(
+      table,
+      /^truyen$|ten truyen/
+    );
+    const typeIx = headerIndex(
+      table,
+      /loai nhan/
+    );
+    const receivedIx = headerIndex(
+      table,
+      /kim cuong.*diem sao.*ban nhan|ban nhan/
+    );
+
+    if (storyIx < 0 || receivedIx < 0) return [];
+
+    const map = new Map();
+
+    for (const tr of table.querySelectorAll('tbody tr')) {
+      const cells = [...tr.querySelectorAll('td')];
+      if (!cells.length) continue;
+
+      const title = text(cells[storyIx]?.textContent);
+
+      if (
+        !title ||
+        /chua co|dang tai|khong co/i.test(norm(title))
+      ) {
+        continue;
+      }
+
+      const receiveType =
+        typeIx >= 0
+          ? norm(cells[typeIx]?.textContent)
+          : 'kim cuong';
+
+      // User chỉ cần KC thu về, bỏ các dòng nhận điểm sao.
+      if (
+        receiveType &&
+        !receiveType.includes('kim cuong')
+      ) {
+        continue;
+      }
+
+      const kc =
+        parseLooseNumber(cells[receivedIx]?.textContent) || 0;
+
+      const prev = map.get(title) || {
+        title,
+        sales: 0,
+        kc: 0,
+      };
+
+      prev.sales += 1;
+      prev.kc += kc;
+      map.set(title, prev);
+    }
+
+    return [...map.values()];
+  }
+
+  function mergeStoryRevenue(primary, fallback) {
+    if (primary?.length) return primary;
+
+    return fallback || [];
+  }
+
+  function matchStoryIdByTitle(title) {
+    const target = norm(title);
+    if (!target) return null;
+
+    for (const story of state.stories.values()) {
+      if (norm(story.title) === target) {
+        return story.id;
+      }
+    }
+
+    return null;
+  }
+
+  function sortStoryRevenue(rows) {
+    return [...rows]
+      .map(row => ({
+        ...row,
+        storyId:
+          row.storyId ||
+          matchStoryIdByTitle(row.title),
+      }))
+      .sort((a, b) => {
+        const aSelected =
+          Number(a.storyId) ===
+          Number(state.selectedStoryId);
+        const bSelected =
+          Number(b.storyId) ===
+          Number(state.selectedStoryId);
+
+        if (aSelected !== bSelected) {
+          return aSelected ? -1 : 1;
+        }
+
+        return (
+          Number(b.kc || 0) -
+            Number(a.kc || 0) ||
+          Number(b.sales || 0) -
+            Number(a.sales || 0) ||
+          a.title.localeCompare(b.title, 'vi')
+        );
+      });
+  }
+
+  async function loadRevenueLiveProbe(
+    url = routeUrl('/truyen/doanh-thu')
+  ) {
+    return await new Promise((resolve, reject) => {
+      const frame = document.createElement('iframe');
+
+      frame.setAttribute(
+        'sandbox',
+        'allow-scripts allow-same-origin'
+      );
+      frame.setAttribute('aria-hidden', 'true');
+
+      frame.style.cssText =
+        'position:fixed;left:-20000px;top:-20000px;' +
+        'width:1200px;height:900px;opacity:0;' +
+        'pointer-events:none;border:0';
+
+      let finished = false;
+
+      const finish = (fn, value) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+
+        try {
+          frame.remove();
+        } catch {}
+
+        fn(value);
+      };
+
+      const timeout = setTimeout(
+        () => finish(
+          reject,
+          new Error('Revenue live probe timeout')
+        ),
+        12000
+      );
+
+      frame.onerror = () =>
+        finish(
+          reject,
+          new Error('Revenue iframe load error')
+        );
+
+      frame.onload = async () => {
+        try {
+          const win = frame.contentWindow;
+          const doc = frame.contentDocument;
+
+          if (!win || !doc?.documentElement) {
+            throw new Error('Revenue iframe NO_DOCUMENT');
+          }
+
+          // Chờ AJAX/DataTables của trang gốc hoàn tất.
+          const started = Date.now();
+
+          while (Date.now() - started < 5500) {
+            const table = [
+              ...doc.querySelectorAll('table'),
+            ].find(t => {
+              const h = norm(
+                [...t.querySelectorAll('thead th')]
+                  .map(x => x.textContent)
+                  .join(' | ')
+              );
+
+              return (
+                h.includes('ten truyen') &&
+                h.includes('doanh thu') &&
+                h.includes('kim cuong')
+              );
+            });
+
+            const usefulRows = table
+              ? [...table.querySelectorAll('tbody tr')]
+                  .filter(tr => {
+                    const t = norm(tr.textContent);
+                    return (
+                      t &&
+                      !t.includes('dang tai')
+                    );
+                  })
+              : [];
+
+            if (usefulRows.length) break;
+            await sleep(180);
+          }
+
+          const stats = {
+            totalKC:
+              metricNumber(doc, 'Tổng doanh thu'),
+            totalSales:
+              metricNumber(doc, 'Tổng lượt bán'),
+            monthKC:
+              metricNumber(doc, 'Doanh thu tháng này'),
+            balanceKC:
+              metricNumber(doc, 'Số dư hiện tại'),
+          };
+
+          const summaryTable = [
+            ...doc.querySelectorAll('table'),
+          ].find(t => {
+            const h = norm(
+              [...t.querySelectorAll('thead th')]
+                .map(x => x.textContent)
+                .join(' | ')
+            );
+
+            return (
+              h.includes('ten truyen') &&
+              h.includes('so luot mua') &&
+              h.includes('doanh thu') &&
+              h.includes('kim cuong')
+            );
+          });
+
+          const stories =
+            aggregateStoryRevenueTable(summaryTable);
+
+          const packages = [];
+          const form =
+            doc.querySelector('#withdrawForm') ||
+            doc.querySelector(
+              'form:has([name="package_vnd"])'
+            );
+
+          if (form) {
+            const radios = [
+              ...form.querySelectorAll(
+                '[name="package_vnd"]'
+              ),
+            ];
+
+            for (const radio of radios) {
+              const vnd =
+                parseLooseNumber(radio.value);
+
+              if (!vnd) continue;
+
+              try {
+                radio.checked = true;
+                radio.dispatchEvent(
+                  new win.Event('change', {
+                    bubbles: true,
+                  })
+                );
+                radio.dispatchEvent(
+                  new win.Event('input', {
+                    bubbles: true,
+                  })
+                );
+                radio.click();
+              } catch {}
+
+              await sleep(90);
+
+              const scope =
+                radio.closest('.modal') ||
+                form.closest('.modal') ||
+                form;
+
+              const raw = text(scope.textContent);
+
+              const costMatch = raw.match(
+                /s[oố]\s*kim\s*cương\s*b[iị]\s*tr[ừu]\s*:\s*([\d.,]+)/i
+              );
+
+              const diamonds = costMatch
+                ? parseLooseNumber(costMatch[1])
+                : null;
+
+              if (
+                Number.isFinite(vnd) &&
+                Number.isFinite(diamonds)
+              ) {
+                packages.push({
+                  vnd,
+                  diamonds,
+                });
+              }
+            }
+          }
+
+          finish(resolve, {
+            stats,
+            stories,
+            packages,
+            period: revenuePeriod(doc),
+          });
+        } catch (err) {
+          finish(reject, err);
+        }
+      };
+
+      frame.src = url;
+      document.documentElement.appendChild(frame);
+    });
+  }
+
+  function computeWithdrawable(
+    balanceKC,
+    packages
+  ) {
+    if (!Number.isFinite(Number(balanceKC))) {
+      return {
+        withdrawableVnd: null,
+        withdrawPackage: null,
+        minWithdrawPackage: null,
+      };
+    }
+
+    const valid = (packages || [])
+      .filter(
+        p =>
+          Number.isFinite(Number(p.vnd)) &&
+          Number.isFinite(Number(p.diamonds))
+      )
+      .map(p => ({
+        vnd: Number(p.vnd),
+        diamonds: Number(p.diamonds),
+      }))
+      .sort((a, b) => a.vnd - b.vnd);
+
+    if (!valid.length) {
+      return {
+        withdrawableVnd: null,
+        withdrawPackage: null,
+        minWithdrawPackage: null,
+      };
+    }
+
+    const affordable = valid
+      .filter(
+        p =>
+          p.diamonds <= Number(balanceKC)
+      )
+      .sort((a, b) => b.vnd - a.vnd)[0] || null;
+
     return {
-      total_diamonds: 0,
-      total_combos: 0,
-      total_chapters: 0,
-      total_sales: 0,
-      month_diamonds: 0,
-      month_combos: 0,
-      month_chapters: 0,
-      month_sales: 0,
+      withdrawableVnd:
+        affordable?.vnd || 0,
+      withdrawPackage:
+        affordable,
+      minWithdrawPackage:
+        valid[0],
     };
   }
 
-  function addStatsSummary(target, source = {}) {
-    for (const key of Object.keys(target)) {
-      target[key] += Number(source?.[key] || 0);
+  function renderRevenue() {
+    const r = state.revenue;
+
+    const amount = $('#ttlcc-revenue-withdrawable');
+    const amountSub = $('#ttlcc-revenue-withdrawable-sub');
+    const total = $('#ttlcc-revenue-total');
+    const totalSub = $('#ttlcc-revenue-total-sub');
+    const month = $('#ttlcc-revenue-month');
+    const period = $('#ttlcc-revenue-period');
+    const list = $('#ttlcc-revenue-stories');
+    const meta = $('#ttlcc-revenue-meta');
+    const refresh = $('#ttlcc-revenue-refresh');
+
+    if (refresh) {
+      refresh.disabled = r.loading;
+      refresh.textContent =
+        r.loading ? 'Đang tải…' : '↻ Refresh';
     }
-    return target;
-  }
 
-  async function loadStats() {
-    // Doanh thu là toàn bộ thư viện truyện, không phụ thuộc selectedStoryId.
-    if (!state.stories.size) {
-      await loadStories();
+    if (amount) {
+      if (r.loading && !r.loaded) {
+        amount.textContent = '…';
+      } else if (
+        Number.isFinite(
+          Number(r.withdrawableVnd)
+        )
+      ) {
+        amount.textContent =
+          formatVnd(r.withdrawableVnd);
+      } else {
+        amount.textContent =
+          formatKC(r.balanceKC);
+      }
     }
 
-    const stories = [...state.stories.values()]
-      .sort((a, b) => Number(a.id) - Number(b.id));
+    if (amountSub) {
+      if (
+        r.minWithdrawPackage &&
+        Number(r.withdrawableVnd) === 0
+      ) {
+        amountSub.textContent =
+          `Số dư ${formatKC(r.balanceKC)} · ` +
+          `cần ${formatKC(r.minWithdrawPackage.diamonds)} ` +
+          `cho gói ${formatVnd(r.minWithdrawPackage.vnd)}`;
+      } else if (r.withdrawPackage) {
+        amountSub.textContent =
+          `Số dư ${formatKC(r.balanceKC)} · ` +
+          `gói này dùng ${formatKC(r.withdrawPackage.diamonds)}`;
+      } else {
+        amountSub.textContent =
+          `Số dư khả dụng: ${formatKC(r.balanceKC)}`;
+      }
+    }
 
-    if (!stories.length) {
-      state.stats = {
-        aggregate: emptyStatsSummary(),
-        items: [],
-        loadedAt: new Date().toISOString(),
-      };
-      renderStats();
-      setStatus('Không có truyện để tải doanh thu.', 'warn');
+    if (total) {
+      total.textContent =
+        formatKC(r.totalKC);
+    }
+
+    if (totalSub) {
+      totalSub.textContent =
+        Number.isFinite(Number(r.totalSales))
+          ? `${Number(r.totalSales).toLocaleString('vi-VN')} lượt bán`
+          : '— lượt bán';
+    }
+
+    if (month) {
+      month.textContent =
+        formatKC(r.monthKC);
+    }
+
+    if (period) {
+      period.textContent =
+        r.period || 'Kỳ hiện tại';
+    }
+
+    if (meta) {
+      if (r.loading) {
+        meta.textContent =
+          'Đang đọc doanh thu…';
+      } else if (r.error) {
+        meta.textContent =
+          r.error;
+      } else if (r.updatedAt) {
+        meta.textContent =
+          `Cập nhật ${new Date(
+            r.updatedAt
+          ).toLocaleTimeString()}`;
+      } else {
+        meta.textContent = '';
+      }
+    }
+
+    if (!list) return;
+
+    if (r.loading && !r.loaded) {
+      list.innerHTML =
+        '<div class="ttlcc-empty">Đang tổng hợp theo truyện…</div>';
       return;
     }
 
-    setStatus(`Đang tải doanh thu 0/${stories.length} truyện...`);
+    if (!r.stories.length) {
+      list.innerHTML =
+        '<div class="ttlcc-empty">Chưa có doanh thu KC theo truyện.</div>';
+      return;
+    }
 
-    let completed = 0;
+    list.innerHTML = r.stories
+      .map(row => {
+        const selected =
+          Number(row.storyId) ===
+          Number(state.selectedStoryId);
 
-    // GET-only: có thể đọc song song nhẹ để tránh chậm khi có nhiều truyện.
-    const results = await runPool(
-      stories,
-      3,
-      async story => {
-        const data = await getJson(
-          route(`/profile/stories/${story.id}/stats`),
-          `GET stats #${story.id}`
-        );
+        return `
+          <div
+            class="ttlcc-revenue-story ${selected ? 'selected' : ''}"
+            ${row.storyId ? `data-story-revenue-id="${row.storyId}"` : ''}
+          >
+            <div class="ttlcc-revenue-story-main">
+              <div class="ttlcc-revenue-story-title">
+                ${esc(row.title)}
+                ${selected ? '<span class="ttlcc-current-chip">đang chọn</span>' : ''}
+              </div>
+            </div>
+            <div class="ttlcc-revenue-story-sales">
+              ${Number(row.sales || 0).toLocaleString('vi-VN')}
+              <span>lượt</span>
+            </div>
+            <div class="ttlcc-revenue-story-kc">
+              ${Number(row.kc || 0).toLocaleString('vi-VN')}
+              <span>KC</span>
+            </div>
+          </div>
+        `;
+      })
+      .join('');
 
-        completed++;
-        setStatus(`Đang tải doanh thu ${completed}/${stories.length} truyện...`);
+    list
+      .querySelectorAll('[data-story-revenue-id]')
+      .forEach(el => {
+        el.addEventListener('click', async () => {
+          const id = Number(
+            el.dataset.storyRevenueId
+          );
 
-        return {
-          storyId: Number(story.id),
-          title: story.title || `Truyện #${story.id}`,
-          status: story.status || '',
-          summary: {
-            ...emptyStatsSummary(),
-            ...(data?.summary || {}),
-          },
-          type: data?.type || '',
-          unit: data?.unit || '',
-          chartTitle: data?.title || '',
-          labels: Array.isArray(data?.labels) ? data.labels : [],
-          data: Array.isArray(data?.data) ? data.data : [],
-        };
-      }
-    );
+          if (
+            !id ||
+            id === Number(state.selectedStoryId)
+          ) {
+            return;
+          }
 
-    const items = [];
-    const aggregate = emptyStatsSummary();
-
-    for (let i = 0; i < stories.length; i++) {
-      const story = stories[i];
-      const result = results[i];
-
-      if (result?.ok && result.value) {
-        items.push(result.value);
-        addStatsSummary(aggregate, result.value.summary);
-      } else {
-        items.push({
-          storyId: Number(story.id),
-          title: story.title || `Truyện #${story.id}`,
-          status: story.status || '',
-          summary: emptyStatsSummary(),
-          error: result?.error?.message || 'Không tải được thống kê.',
+          try {
+            await selectStory(id, {
+              loadChaptersNow: false,
+            });
+            renderRevenue();
+          } catch {}
         });
+      });
+  }
 
+  async function loadRevenueData(
+    { force = false } = {}
+  ) {
+    const r = state.revenue;
+
+    if (r.loading) return;
+    if (r.loaded && !force) {
+      renderRevenue();
+      return;
+    }
+
+    r.loading = true;
+    r.error = '';
+    renderRevenue();
+
+    try {
+      let live = null;
+
+      try {
+        live = await loadRevenueLiveProbe();
+      } catch (err) {
         addLog(
-          `Stats FAIL #${story.id} ${story.title || ''}: ${result?.error?.message || 'unknown'}`,
+          `Revenue live probe lỗi: ${err.message}; dùng fetch fallback.`,
           'warn'
         );
       }
-    }
 
-    state.stats = {
-      aggregate,
-      items,
-      loadedAt: new Date().toISOString(),
-    };
+      let revenueDoc = null;
+      let revenueUrl =
+        routeUrl('/truyen/doanh-thu');
 
-    renderStats();
+      if (!live) {
+        const fetched = await fetchDoc(
+          revenueUrl,
+          'GET doanh thu'
+        );
 
-    const failed = items.filter(x => x.error).length;
-    if (failed) {
-      setStatus(
-        `Đã tải doanh thu ${items.length - failed}/${items.length} truyện; ${failed} lỗi.`,
-        'warn'
-      );
-      toast(
-        `Doanh thu: ${failed} truyện không tải được stats. Xem danh sách để biết chi tiết.`,
-        'warn',
-        5000
-      );
-    } else {
-      setStatus(`Đã tải doanh thu toàn bộ ${items.length} truyện.`, 'success');
-      addLog(`Stats toàn bộ: ${items.length}/${items.length} truyện.`);
-    }
-  }
+        revenueDoc = fetched.doc;
+        revenueUrl = fetched.finalUrl;
 
-  function renderStats() {
-    const host = $('#ytlcc-stats');
-    if (!host) return;
+        live = {
+          stats: {
+            totalKC:
+              metricNumber(
+                revenueDoc,
+                'Tổng doanh thu'
+              ),
+            totalSales:
+              metricNumber(
+                revenueDoc,
+                'Tổng lượt bán'
+              ),
+            monthKC:
+              metricNumber(
+                revenueDoc,
+                'Doanh thu tháng này'
+              ),
+            balanceKC:
+              metricNumber(
+                revenueDoc,
+                'Số dư hiện tại'
+              ),
+          },
+          stories: [],
+          packages: [],
+          period:
+            revenuePeriod(revenueDoc),
+        };
 
-    if (!state.stats) {
-      host.innerHTML = '<div class="ytlcc-empty">Chưa tải thống kê.</div>';
-      return;
-    }
+        const summaryTable = [
+          ...revenueDoc.querySelectorAll('table'),
+        ].find(t => {
+          const h = norm(
+            [...t.querySelectorAll('thead th')]
+              .map(x => x.textContent)
+              .join(' | ')
+          );
 
-    const a = state.stats.aggregate || emptyStatsSummary();
-    const items = state.stats.items || [];
+          return (
+            h.includes('ten truyen') &&
+            h.includes('doanh thu') &&
+            h.includes('kim cuong')
+          );
+        });
 
-    host.innerHTML = `
-      <div class="ytlcc-card">
-        <h3>Tổng doanh thu tất cả truyện</h3>
-        <div class="ytlcc-stat-grid">
-          <div class="ytlcc-stat">
-            <span>Tổng Kim Cương</span>
-            <strong>${Number(a.total_diamonds || 0).toLocaleString('vi-VN')}</strong>
-          </div>
-          <div class="ytlcc-stat">
-            <span>Kim Cương tháng này</span>
-            <strong>${Number(a.month_diamonds || 0).toLocaleString('vi-VN')}</strong>
-          </div>
-          <div class="ytlcc-stat">
-            <span>Tổng lượt bán</span>
-            <strong>${Number(a.total_sales || 0).toLocaleString('vi-VN')}</strong>
-          </div>
-          <div class="ytlcc-stat">
-            <span>Lượt bán tháng này</span>
-            <strong>${Number(a.month_sales || 0).toLocaleString('vi-VN')}</strong>
-          </div>
-          <div class="ytlcc-stat">
-            <span>Tổng combo</span>
-            <strong>${Number(a.total_combos || 0).toLocaleString('vi-VN')}</strong>
-          </div>
-          <div class="ytlcc-stat">
-            <span>Tổng chương lẻ đã bán</span>
-            <strong>${Number(a.total_chapters || 0).toLocaleString('vi-VN')}</strong>
-          </div>
-        </div>
-      </div>
+        live.stories =
+          aggregateStoryRevenueTable(
+            summaryTable
+          );
+      }
 
-      <div class="ytlcc-card ytlcc-mt">
-        <div class="ytlcc-toolbar" style="margin-bottom:8px">
-          <h3 style="margin:0;flex:1">Chi tiết từng truyện</h3>
-          <span class="ytlcc-muted">${items.length} truyện</span>
-        </div>
+      // Fallback riêng cho danh sách truyện:
+      // /customer/purchases có revenueTable server-rendered.
+      let fallbackStories = [];
 
-        <div class="ytlcc-table-wrap">
-          <table class="ytlcc-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Truyện</th>
-                <th>Tổng KC</th>
-                <th>KC tháng</th>
-                <th>Tổng lượt bán</th>
-                <th>Bán tháng</th>
-                <th>Combo</th>
-                <th>Chương lẻ</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${
-                items.length
-                  ? items.map(item => {
-                      const s = item.summary || emptyStatsSummary();
-                      return `
-                        <tr>
-                          <td>${esc(item.storyId)}</td>
-                          <td class="ytlcc-title-cell" title="${esc(item.title)}">
-                            ${esc(item.title)}
-                            ${item.error ? `<div class="ytlcc-muted" style="color:var(--yt-danger)">${esc(item.error)}</div>` : ''}
-                          </td>
-                          <td>${Number(s.total_diamonds || 0).toLocaleString('vi-VN')}</td>
-                          <td>${Number(s.month_diamonds || 0).toLocaleString('vi-VN')}</td>
-                          <td>${Number(s.total_sales || 0).toLocaleString('vi-VN')}</td>
-                          <td>${Number(s.month_sales || 0).toLocaleString('vi-VN')}</td>
-                          <td>${Number(s.total_combos || 0).toLocaleString('vi-VN')}</td>
-                          <td>${Number(s.total_chapters || 0).toLocaleString('vi-VN')}</td>
-                        </tr>
-                      `;
-                    }).join('')
-                  : '<tr><td colspan="8" class="ytlcc-empty">Không có dữ liệu.</td></tr>'
-              }
-            </tbody>
-          </table>
-        </div>
-      </div>
-    `;
-  }
+      if (!live.stories?.length) {
+        try {
+          const purchases = await fetchDoc(
+            routeUrl('/customer/purchases'),
+            'GET revenue history'
+          );
 
-  // ============================================================
-  // UI
-  // ============================================================
+          const historyTable =
+            purchases.doc.querySelector(
+              '#revenueTable'
+            ) ||
+            [...purchases.doc.querySelectorAll('table')]
+              .find(t => {
+                const h = norm(
+                  [...t.querySelectorAll('thead th')]
+                    .map(x => x.textContent)
+                    .join(' | ')
+                );
 
-  function tab(name) {
-    state.activeTab = name;
-    savePrefs();
+                return (
+                  h.includes('loai nhan') &&
+                  h.includes('ban nhan') &&
+                  h.includes('truyen')
+                );
+              });
 
-    for (const btn of $$('.ytlcc-tab-btn')) {
-      btn.classList.toggle('active', btn.dataset.tab === name);
-    }
-
-    for (const pane of $$('.ytlcc-tab-pane')) {
-      pane.classList.toggle('active', pane.dataset.pane === name);
-    }
-
-    if (name === 'chapters' && state.selectedStoryId && !state.chapters.length) {
-      loadChapters().catch(err => toast(err.message, 'error', 5000));
-    }
-
-    if (name === 'stats' && state.selectedStoryId && !state.stats) {
-      loadStats().catch(err => toast(err.message, 'error', 5000));
-    }
-  }
-
-  function renderRunState() {
-    for (const el of $$('[data-run-action]')) {
-      el.disabled = !!state.running;
-    }
-
-    const cancel = $('#ytlcc-cancel-run');
-    if (cancel) cancel.disabled = !state.running;
-  }
-
-  function openPanel() {
-    state.opened = true;
-    $('#ytlcc-overlay')?.classList.add('show');
-  }
-
-  function closePanel() {
-    if (state.running) {
-      toast('Đang chạy tác vụ. Hãy Hủy trước khi đóng.', 'warn');
-      return;
-    }
-
-    state.opened = false;
-    $('#ytlcc-overlay')?.classList.remove('show');
-  }
-
-  function bindUi() {
-    $('#ytlcc-launch')?.addEventListener('click', openPanel);
-    $('#ytlcc-close')?.addEventListener('click', closePanel);
-    $('#ytlcc-theme-toggle')?.addEventListener('click', toggleTheme);
-
-    for (const btn of $$('.ytlcc-tab-btn')) {
-      btn.addEventListener('click', () => tab(btn.dataset.tab));
-    }
-
-    $('#ytlcc-refresh-stories')?.addEventListener('click', () => {
-      loadStories().catch(err => toast(err.message, 'error', 6000));
-    });
-
-    $('#ytlcc-refresh-chapters')?.addEventListener('click', () => {
-      loadChapters().catch(err => toast(err.message, 'error', 6000));
-    });
-
-    $('#ytlcc-download-txt')?.addEventListener('click', () => {
-      downloadStoryTxt().catch(err => {
-        toast(`Không tải được TXT: ${err.message}`, 'error', 6000);
-        setStatus(err.message, 'error');
-      });
-    });
-
-    $('#ytlcc-open-pass-bulk')?.addEventListener('click', openBulkPassModal);
-    $('#ytlcc-pass-close')?.addEventListener('click', closeBulkPassModal);
-    $('#ytlcc-pass-cancel')?.addEventListener('click', closeBulkPassModal);
-
-    $('#ytlcc-pass-apply')?.addEventListener('click', () => {
-      bulkSetExistingPassword({ clear: false }).catch(err => {
-        toast(err.message, 'error', 7000);
-        setStatus(err.message, 'error');
-      });
-    });
-
-    $('#ytlcc-pass-clear')?.addEventListener('click', () => {
-      bulkSetExistingPassword({ clear: true }).catch(err => {
-        toast(err.message, 'error', 7000);
-        setStatus(err.message, 'error');
-      });
-    });
-
-    const bulkPassInput = $('#ytlcc-pass-value');
-    if (bulkPassInput) {
-      bulkPassInput.addEventListener('input', () => {
-        state.bulk.hPassword = String(bulkPassInput.value || '');
-        const mainPass = $('#ytlcc-h-password');
-        if (mainPass) mainPass.value = state.bulk.hPassword;
-        savePrefs();
-      });
-    }
-
-    $('#ytlcc-load-stats')?.addEventListener('click', () => {
-      loadStats().catch(err => toast(err.message, 'error', 6000));
-    });
-
-    const hPasswordInput = $('#ytlcc-h-password');
-    if (hPasswordInput) {
-      const persistHPassword = () => {
-        state.bulk.hPassword = String(hPasswordInput.value || '');
-        savePrefs();
-
-        const saved = $('#ytlcc-h-pass-saved');
-        if (saved) {
-          saved.textContent = 'Đã lưu';
-          clearTimeout(saved._ytlTimer);
-          saved._ytlTimer = setTimeout(() => {
-            saved.textContent = '';
-          }, 1200);
+          fallbackStories =
+            aggregateRevenueHistory(
+              historyTable
+            );
+        } catch (err) {
+          addLog(
+            `Revenue history fallback lỗi: ${err.message}`,
+            'warn'
+          );
         }
-      };
+      }
 
-      hPasswordInput.addEventListener('input', persistHPassword);
-      hPasswordInput.addEventListener('change', persistHPassword);
+      const stories =
+        mergeStoryRevenue(
+          live.stories,
+          fallbackStories
+        );
+
+      const withdraw =
+        computeWithdrawable(
+          live.stats?.balanceKC,
+          live.packages
+        );
+
+      r.totalKC =
+        live.stats?.totalKC ?? null;
+      r.totalSales =
+        live.stats?.totalSales ?? null;
+      r.monthKC =
+        live.stats?.monthKC ?? null;
+      r.balanceKC =
+        live.stats?.balanceKC ?? null;
+
+      r.withdrawableVnd =
+        withdraw.withdrawableVnd;
+      r.withdrawPackage =
+        withdraw.withdrawPackage;
+      r.minWithdrawPackage =
+        withdraw.minWithdrawPackage;
+
+      r.period =
+        live.period || '';
+      r.stories =
+        sortStoryRevenue(stories);
+
+      r.loaded = true;
+      r.updatedAt =
+        new Date().toISOString();
+
+      const missing = [];
+
+      if (!Number.isFinite(Number(r.balanceKC))) {
+        missing.push('số dư');
+      }
+      if (!Number.isFinite(Number(r.totalKC))) {
+        missing.push('tổng doanh thu');
+      }
+      if (!Number.isFinite(Number(r.monthKC))) {
+        missing.push('doanh thu tháng');
+      }
+
+      if (missing.length) {
+        r.error =
+          `Thiếu dữ liệu: ${missing.join(', ')}`;
+      }
+
+      addLog(
+        `Doanh thu: ${r.stories.length} truyện · ` +
+        `${formatKC(r.totalKC)} tổng · ` +
+        `${formatKC(r.balanceKC)} số dư.`,
+        r.error ? 'warn' : 'ok'
+      );
+    } catch (err) {
+      r.error =
+        `Không tải được doanh thu: ${err.message}`;
+      addLog(r.error, 'error');
+    } finally {
+      r.loading = false;
+      renderRevenue();
     }
-
-    $('#ytlcc-load-txt')?.addEventListener('click', () => {
-      const input = $('#ytlcc-txt-file');
-      if (!input) return;
-      input.value = '';
-      input.click();
-    });
-
-    $('#ytlcc-txt-file')?.addEventListener('change', event => {
-      const files = [...(event.target?.files || [])];
-      if (!files.length) return;
-
-      loadTxtFiles(files).catch(err => {
-        state.bulk.parsed = [];
-        renderBulkPreview();
-        toast(`Không nạp được TXT: ${err.message}`, 'error', 8000);
-        setStatus(err.message, 'error');
-      });
-    });
-
-    const bulkInput = $('#ytlcc-bulk-input');
-    if (bulkInput) {
-      bulkInput.addEventListener('dragover', event => {
-        if (!event.dataTransfer?.types?.includes('Files')) return;
-        event.preventDefault();
-        bulkInput.classList.add('ytlcc-drop-active');
-      });
-
-      bulkInput.addEventListener('dragleave', () => {
-        bulkInput.classList.remove('ytlcc-drop-active');
-      });
-
-      bulkInput.addEventListener('drop', event => {
-        const files = [...(event.dataTransfer?.files || [])];
-        if (!files.length) return;
-        event.preventDefault();
-        bulkInput.classList.remove('ytlcc-drop-active');
-
-        loadTxtFiles(files).catch(err => {
-          state.bulk.parsed = [];
-          renderBulkPreview();
-          toast(`Không nạp được TXT: ${err.message}`, 'error', 8000);
-          setStatus(err.message, 'error');
-        });
-      });
-    }
-
-    $('#ytlcc-bulk-parse')?.addEventListener('click', parseBulkFromUi);
-
-    $('#ytlcc-smart-sync')?.addEventListener('click', () => {
-      smartSyncTxt().catch(err => {
-        toast(err.message, 'error', 7000);
-        setStatus(err.message, 'error');
-      });
-    });
-
-    const updateActions = {
-      'ytlcc-update-price': 'price',
-    };
-
-    for (const [id, mode] of Object.entries(updateActions)) {
-      $(`#${id}`)?.addEventListener('click', () => {
-        bulkUpdate(mode).catch(err => {
-          toast(err.message, 'error', 7000);
-          setStatus(err.message, 'error');
-        });
-      });
-    }
-
-    $('#ytlcc-cancel-run')?.addEventListener('click', () => {
-      if (!state.running) return;
-      state.cancelled = true;
-      setStatus('Đang hủy...', 'warn');
-      addLog('Người dùng yêu cầu hủy.', 'warn');
-    });
-
-    $('#ytlcc-clear-log')?.addEventListener('click', () => {
-      state.log = [];
-      const host = $('#ytlcc-log');
-      if (host) host.innerHTML = '';
-    });
-
-    $('#ytlcc-editor-close')?.addEventListener('click', () => {
-      $('#ytlcc-editor-modal')?.classList.remove('show');
-    });
-
-    $('#ytlcc-editor-save')?.addEventListener('click', () => {
-      saveSingleEditor().catch(err => toast(err.message, 'error', 6000));
-    });
   }
 
-  function injectCss() {
-    if ($('#ytlcc-style')) return;
+  // Chỉ giữ fallback trang gốc khi custom live-form bị web đổi cấu trúc.
+  function openNativeTool(
+    url,
+    title = 'Trang gốc'
+  ) {
+    openModal(
+      title,
+      `<iframe
+        id="ttlcc-fallback-frame"
+        src="${esc(url)}"
+        style="width:100%;height:min(78vh,820px);border:0;border-radius:9px;background:#fff"
+      ></iframe>`
+    );
+
+    const frame =
+      $('#ttlcc-fallback-frame');
+
+    if (!frame) return;
+
+    frame.onload = () => {
+      try {
+        const doc = frame.contentDocument;
+        if (!doc) return;
+
+        const style =
+          doc.createElement('style');
+
+        style.textContent = `
+          .main-header,
+          .main-sidebar,
+          .control-sidebar,
+          footer.main-footer {
+            display:none!important
+          }
+
+          .content-wrapper {
+            margin-left:0!important;
+            min-height:100vh!important
+          }
+        `;
+
+        doc.head.appendChild(style);
+      } catch {}
+    };
+  }
+
+  // ==========================================================
+  // MODAL
+  // ==========================================================
+
+  function openModal(title, html = '') {
+    const modal = $('#ttlcc-modal');
+    if (!modal) return;
+    $('#ttlcc-modal-title').textContent = title;
+    $('#ttlcc-modal-body').innerHTML = html;
+    modal.classList.add('open');
+  }
+
+  function closeModal() {
+    $('#ttlcc-modal')?.classList.remove('open');
+    const body = $('#ttlcc-modal-body');
+    if (body) body.innerHTML = '';
+  }
+
+  // ==========================================================
+  // UI
+  // ==========================================================
+
+  const CSS_TEXT = `
+    :root {
+      --ttlcc-bg:#10151c;
+      --ttlcc-panel:#171e27;
+      --ttlcc-panel2:#1c2530;
+      --ttlcc-input:#111922;
+      --ttlcc-border:#2d3947;
+      --ttlcc-text:#d7dee7;
+      --ttlcc-soft:#a8b4c1;
+      --ttlcc-muted:#788697;
+      --ttlcc-primary:#5f95a1;
+      --ttlcc-primary2:#75aab5;
+      --ttlcc-ok:#79a184;
+      --ttlcc-warn:#c09a62;
+      --ttlcc-danger:#b46268;
+      --ttlcc-shadow:0 24px 65px rgba(0,0,0,.42);
+    }
+    #ttlcc-panel,#ttlcc-panel *{box-sizing:border-box}
+    #ttlcc-panel{position:fixed;z-index:2147483000;top:14px;right:14px;width:min(980px,calc(100vw - 28px));height:min(730px,calc(100vh - 28px));max-height:calc(100vh - 28px);background:var(--ttlcc-bg);color:var(--ttlcc-text);border:1px solid var(--ttlcc-border);border-radius:13px;box-shadow:var(--ttlcc-shadow);font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;overflow:hidden;display:flex;flex-direction:column}
+    #ttlcc-panel.ttlcc-minimized{top:auto;right:78px;bottom:16px;width:68px;height:36px;max-height:36px;border-radius:10px;cursor:pointer}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-main,#ttlcc-panel.ttlcc-minimized .ttlcc-tabs,#ttlcc-panel.ttlcc-minimized .ttlcc-selection{display:none!important}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-head{height:34px;min-height:34px;padding:0;justify-content:center;cursor:pointer;background:linear-gradient(135deg,#293a43,#355149)}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-head-main{display:flex;align-items:center;justify-content:center}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-head-title{font-size:0;line-height:1}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-head-title::after{content:"TTL";font-size:12px;font-weight:850;letter-spacing:.5px}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-head-sub,#ttlcc-panel.ttlcc-minimized .ttlcc-head-actions{display:none!important}
+    .ttlcc-head{display:flex;align-items:center;justify-content:space-between;gap:9px;padding:9px 11px;background:linear-gradient(135deg,#293a43,#314b53 55%,#355149);color:white}
+    .ttlcc-head-main{min-width:0}.ttlcc-head-title{font-size:15px;font-weight:800}.ttlcc-head-sub{font-size:10px;opacity:.74;margin-top:1px}
+    .ttlcc-head-actions{display:flex;align-items:center;gap:5px}.ttlcc-badge{padding:3px 7px;border-radius:999px;background:rgba(255,255,255,.12);font-size:10px;font-weight:700}
+    .ttlcc-icon{width:30px;height:30px;border:1px solid rgba(255,255,255,.25);border-radius:8px;background:rgba(255,255,255,.10);color:#fff;cursor:pointer}
+    .ttlcc-selection{display:flex;align-items:center;gap:8px;padding:7px 10px;background:var(--ttlcc-panel);border-bottom:1px solid var(--ttlcc-border)}
+    .ttlcc-selection-main{min-width:0;flex:1}.ttlcc-selected-title{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ttlcc-selected-sub{font-size:11px;color:var(--ttlcc-muted)}
+    .ttlcc-tabs{display:flex;gap:3px;padding:5px 8px;background:#131a22;border-bottom:1px solid var(--ttlcc-border);overflow:auto}
+    .ttlcc-tab-btn{border:1px solid transparent;background:transparent;color:var(--ttlcc-soft);padding:5px 9px;border-radius:7px;cursor:pointer;white-space:nowrap;font-weight:700;font-size:11.5px}
+    .ttlcc-tab-btn.active{background:var(--ttlcc-panel2);border-color:var(--ttlcc-border);color:#fff}
+    .ttlcc-main{min-height:0;flex:1;overflow:auto;padding:8px}
+    .ttlcc-pane{display:none}.ttlcc-pane.active{display:block}
+    .ttlcc-grid2{display:grid;grid-template-columns:minmax(240px,300px) minmax(0,1fr);gap:8px}.ttlcc-grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+    .ttlcc-card{background:var(--ttlcc-panel);border:1px solid var(--ttlcc-border);border-radius:9px;padding:9px;margin-bottom:8px}.ttlcc-card-title{font-weight:800;margin-bottom:7px;display:flex;align-items:center;justify-content:space-between;gap:6px}
+    .ttlcc-toolbar{display:flex;align-items:center;gap:5px;flex-wrap:wrap}.ttlcc-toolbar + .ttlcc-toolbar{margin-top:6px}
+    .ttlcc-input,.ttlcc-card input[type="text"],.ttlcc-card input[type="number"],.ttlcc-card input[type="date"],.ttlcc-card input[type="datetime-local"],.ttlcc-card input[type="url"],.ttlcc-card input[type="file"],.ttlcc-card select,.ttlcc-live-form input,.ttlcc-live-form select,.ttlcc-live-form textarea{border:1px solid var(--ttlcc-border);background:var(--ttlcc-input);color:var(--ttlcc-text);border-radius:7px;padding:5px 7px;outline:none;max-width:100%;font-size:11.5px}
+    .ttlcc-input:focus,.ttlcc-live-form input:focus,.ttlcc-live-form select:focus,.ttlcc-live-form textarea:focus{border-color:var(--ttlcc-primary);box-shadow:0 0 0 3px rgba(95,149,161,.12)}
+    .ttlcc-btn{border:1px solid transparent;border-radius:7px;padding:5px 8px;min-height:28px;cursor:pointer;font-weight:700;background:var(--ttlcc-panel2);color:var(--ttlcc-text);font-size:11.5px}.ttlcc-btn:disabled{opacity:.42;cursor:not-allowed}
+    .ttlcc-btn-primary{background:var(--ttlcc-primary);color:white}.ttlcc-btn-primary:hover:not(:disabled){background:var(--ttlcc-primary2)}.ttlcc-btn-soft{border-color:var(--ttlcc-border)}.ttlcc-btn-danger{background:var(--ttlcc-danger);color:white}.ttlcc-btn-mini{padding:4px 7px;min-height:26px;font-size:11px}
+    .ttlcc-story-list{max-height:470px;overflow:auto;display:flex;flex-direction:column;gap:4px}.ttlcc-story-item{border:1px solid var(--ttlcc-border);background:#131a22;color:var(--ttlcc-text);border-radius:7px;padding:7px 8px;text-align:left;cursor:pointer;display:flex;align-items:center;gap:6px}.ttlcc-story-item.active{border-color:var(--ttlcc-primary);background:#1b2931}.ttlcc-story-title{flex:1;font-weight:700}.ttlcc-story-id{color:var(--ttlcc-muted);font-size:10px}
+    .ttlcc-stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px}.ttlcc-stat{border:1px solid var(--ttlcc-border);background:var(--ttlcc-panel);border-radius:9px;padding:9px}.ttlcc-stat-label{font-size:10px;color:var(--ttlcc-muted)}.ttlcc-stat-value{font-size:16px;font-weight:800;margin-top:2px;overflow:hidden;text-overflow:ellipsis}
+    .ttlcc-warning{border:1px solid rgba(192,154,98,.45);background:rgba(192,154,98,.08);color:#d8bb8e;padding:9px 11px;border-radius:9px;margin-top:10px}
+    .ttlcc-status{padding:7px 10px;border-radius:8px;background:#18242d;color:#b7c8d0}.ttlcc-status.ok{color:#9fc3a8}.ttlcc-status.warn{color:#d5b37f}.ttlcc-status.error{color:#dc9599}
+    .ttlcc-table-wrap{overflow:auto;max-height:500px;border:1px solid var(--ttlcc-border);border-radius:8px}.ttlcc-table{width:100%;border-collapse:collapse;font-size:11.25px}.ttlcc-table th{position:sticky;top:0;z-index:2;background:#1c2530;color:#c9d2dc;text-align:left}.ttlcc-table th,.ttlcc-table td{padding:5px 6px;border-bottom:1px solid #273240;vertical-align:top}.ttlcc-table tr:hover td{background:#151e27}.ttlcc-table td:not(.ttlcc-left){white-space:nowrap}.ttlcc-row-actions{display:flex;gap:4px}.ttlcc-row-warn td{background:rgba(192,154,98,.05)}.ttlcc-mini-warn{font-size:9px;color:#d3aa72;white-space:normal;max-width:120px}
+    .ttlcc-live-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.ttlcc-field{display:flex;flex-direction:column;gap:3px}.ttlcc-field-wide{grid-column:1/-1}.ttlcc-label{font-weight:700;color:var(--ttlcc-soft);font-size:10.5px}.ttlcc-live-form textarea{width:100%;resize:vertical}.ttlcc-code-area{font:11.5px/1.45 Consolas,"SFMono-Regular",monospace}.ttlcc-choice-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.ttlcc-choice{display:flex;gap:5px;align-items:flex-start;padding:5px 6px;border:1px solid #2b3744;border-radius:6px;background:#121922;font-size:10px}.ttlcc-form-actions{display:flex;justify-content:flex-end;gap:5px}.ttlcc-form-title{font-size:13px;font-weight:800;margin-bottom:7px;color:#fff}
+    .ttlcc-empty,.ttlcc-loading{padding:14px;color:var(--ttlcc-muted);text-align:center}.ttlcc-error-box{padding:10px;border:1px solid rgba(180,98,104,.5);background:rgba(180,98,104,.08);border-radius:9px;color:#dc9599}.ttlcc-error-box .ttlcc-btn{margin-top:8px}
+    .ttlcc-bulk-layout{display:grid;grid-template-columns:295px minmax(0,1fr);gap:8px}.ttlcc-textarea{width:100%;min-height:185px;resize:vertical;border:1px solid var(--ttlcc-border);background:var(--ttlcc-input);color:var(--ttlcc-text);border-radius:7px;padding:7px;font:11.25px/1.45 Consolas,monospace}.ttlcc-inline-price{display:flex;gap:3px}.ttlcc-inline-price select{width:68px}.ttlcc-inline-price input{width:48px}.ttlcc-price-lock{color:#91b39a;font-weight:700}.ttlcc-state{font-weight:800;font-size:9px}.ttlcc-state.pending{color:#d1ad76}.ttlcc-state.ok{color:#88ad91}.ttlcc-state.bad{color:#d1858a}
+    .ttlcc-log{height:135px;overflow:auto;background:#0d1319;border:1px solid #222e39;border-radius:7px;padding:6px;font:10.5px/1.45 Consolas,monospace}.ttlcc-log-line.ok{color:#8fb69a}.ttlcc-log-line.warn{color:#d0aa74}.ttlcc-log-line.error{color:#d4858a}.ttlcc-log-line.info{color:#abb6c2}
+    #ttlcc-modal{position:fixed;z-index:2147483200;inset:0;background:rgba(0,0,0,.66);display:none;align-items:center;justify-content:center;padding:14px}#ttlcc-modal.open{display:flex}.ttlcc-modal-box{width:min(900px,95vw);max-height:90vh;display:flex;flex-direction:column;background:var(--ttlcc-bg);border:1px solid var(--ttlcc-border);border-radius:11px;box-shadow:var(--ttlcc-shadow)}.ttlcc-modal-head{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:var(--ttlcc-panel2);border-bottom:1px solid var(--ttlcc-border);font-weight:800}.ttlcc-modal-body{overflow:auto;padding:9px}
+    #ttlcc-toast-host{position:fixed;z-index:2147483300;right:22px;bottom:22px;display:flex;flex-direction:column;gap:7px;pointer-events:none}.ttlcc-toast{max-width:420px;padding:9px 11px;border-radius:9px;background:#25313d;color:#fff;box-shadow:0 10px 28px rgba(0,0,0,.35);opacity:1;transform:translateY(0);transition:.2s}.ttlcc-toast.ok{background:#355344}.ttlcc-toast.warn{background:#665235}.ttlcc-toast.error{background:#6a393e}.ttlcc-toast.out{opacity:0;transform:translateY(8px)}
+    .ttlcc-revenue-top{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-bottom:8px}
+    .ttlcc-revenue-summary{border:1px solid var(--ttlcc-border);background:var(--ttlcc-panel);border-radius:9px;padding:9px;min-width:0}
+    .ttlcc-revenue-summary-label{font-size:10px;color:var(--ttlcc-muted);font-weight:700}
+    .ttlcc-revenue-summary-value{margin-top:3px;font-size:17px;font-weight:850;color:#f4f7fa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ttlcc-revenue-summary-sub{margin-top:2px;font-size:10px;color:var(--ttlcc-soft);min-height:14px}
+    .ttlcc-revenue-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px}
+    .ttlcc-revenue-meta{font-size:11px;color:var(--ttlcc-muted)}
+    .ttlcc-revenue-story-list{display:flex;flex-direction:column;border:1px solid var(--ttlcc-border);border-radius:10px;overflow:hidden;background:var(--ttlcc-panel)}
+    .ttlcc-revenue-story{display:grid;grid-template-columns:minmax(0,1fr) 80px 90px;gap:7px;align-items:center;padding:7px 9px;border-bottom:1px solid #293543;cursor:default}
+    .ttlcc-revenue-story:last-child{border-bottom:0}
+    .ttlcc-revenue-story[data-story-revenue-id]{cursor:pointer}
+    .ttlcc-revenue-story[data-story-revenue-id]:hover{background:#19242e}
+    .ttlcc-revenue-story.selected{background:#1b2b31;box-shadow:inset 3px 0 0 var(--ttlcc-primary)}
+    .ttlcc-revenue-story-title{font-weight:750;color:var(--ttlcc-text);min-width:0;overflow:hidden;text-overflow:ellipsis}
+    .ttlcc-current-chip{display:inline-flex;margin-left:6px;padding:2px 6px;border-radius:999px;background:rgba(95,149,161,.16);color:#94c1ca;font-size:9px;vertical-align:1px}
+    .ttlcc-revenue-story-sales,.ttlcc-revenue-story-kc{text-align:right;font-weight:800}
+    .ttlcc-revenue-story-sales span,.ttlcc-revenue-story-kc span{display:block;font-size:9px;color:var(--ttlcc-muted);font-weight:600}
+    .ttlcc-revenue-story-kc{color:#9fc9d2}
+    @media(max-width:900px){#ttlcc-panel{top:7px;right:7px;width:calc(100vw - 14px);height:calc(100vh - 14px);max-height:calc(100vh - 14px)}#ttlcc-panel.ttlcc-minimized{top:auto;right:70px;bottom:12px;width:62px;height:34px;max-height:34px}.ttlcc-grid2,.ttlcc-bulk-layout{grid-template-columns:1fr}.ttlcc-story-list{max-height:240px}.ttlcc-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.ttlcc-revenue-top{grid-template-columns:1fr}.ttlcc-choice-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.ttlcc-live-form{grid-template-columns:1fr}.ttlcc-field-wide{grid-column:1}.ttlcc-grid3{grid-template-columns:1fr}}
+    @media(max-width:560px){.ttlcc-revenue-story{grid-template-columns:minmax(0,1fr) 70px 78px;padding:9px}.ttlcc-revenue-summary-value{font-size:18px}}
+  `;
+
+  function injectUi() {
+    const old = $('#ttl-bulk-panel');
+    if (old) {
+      old.style.display = 'none';
+      addLog('Phát hiện panel v0.7 cũ; đã ẩn UI cũ. Nên disable userscript v0.7 để tránh chạy nền trùng.', 'warn');
+    }
 
     const style = document.createElement('style');
-    style.id = 'ytlcc-style';
-    style.textContent = `
-      #ytlcc-shell,
-      #ytlcc-editor-modal .ytlcc-editor-box,
-      #ytlcc-pass-modal .ytlcc-pass-box{
-        --bg:#f3f5f8;
-        --panel:#ffffff;
-        --panel2:#f7f8fa;
-        --panel3:#edf0f4;
-        --text:#29313d;
-        --soft:#566273;
-        --muted:#8691a1;
-        --line:#d8dee7;
-        --line2:#e7ebf0;
-        --input:#ffffff;
-        --hover:#f0eef8;
-        --active:#e8e3f4;
-        --accent:#7768a8;
-        --accent2:#675894;
-        --accentText:#faf8ff;
-        --green:#477a61;
-        --green2:#3f6d57;
-        --danger:#a55f66;
-        --yt-danger:#a55f66;
-        --shadow:rgba(24,34,48,.18);
-        --code:#202630;
-        --codeText:#d6dde6;
-
-        --h-top:48px;
-        --h-tabs:42px;
-        --h-control:36px;
-        --radius:8px;
-      }
-
-      html[data-ytlcc-theme="dark"] #ytlcc-shell,
-      html[data-ytlcc-theme="dark"] #ytlcc-editor-modal .ytlcc-editor-box,
-      html[data-ytlcc-theme="dark"] #ytlcc-pass-modal .ytlcc-pass-box{
-        --bg:#11161d;
-        --panel:#181e26;
-        --panel2:#1d242d;
-        --panel3:#242d38;
-        --text:#d7dde5;
-        --soft:#b5bfca;
-        --muted:#7f8b9a;
-        --line:#2e3744;
-        --line2:#252e39;
-        --input:#141a21;
-        --hover:#212936;
-        --active:#302c45;
-        --accent:#8c7db8;
-        --accent2:#7768a3;
-        --accentText:#f1edf9;
-        --green:#4c7f66;
-        --green2:#406c57;
-        --danger:#b16b71;
-        --yt-danger:#b16b71;
-        --shadow:rgba(0,0,0,.42);
-        --code:#0f141a;
-        --codeText:#cbd3dd;
-      }
-
-      #ytlcc-launch{
-        position:fixed;right:18px;bottom:18px;z-index:2147483600;
-        height:38px;padding:0 14px;border:1px solid rgba(255,255,255,.10);
-        border-radius:9px;background:#7465a4;color:#f2eefb;
-        box-shadow:0 10px 28px rgba(0,0,0,.28);
-        font:800 12px/1 system-ui,sans-serif;cursor:pointer
-      }
-
-      #ytlcc-overlay{
-        display:none;position:fixed;inset:0;z-index:2147483601;
-        padding:10px;background:rgba(7,10,14,.84);backdrop-filter:blur(4px)
-      }
-      #ytlcc-overlay.show{display:block}
-
-      #ytlcc-shell{
-        width:min(1580px,100%);height:calc(100vh - 20px);margin:0 auto;
-        display:grid;grid-template-rows:var(--h-top) minmax(0,1fr);
-        overflow:hidden;background:var(--bg);color:var(--text);
-        border:1px solid var(--line);border-radius:12px;
-        box-shadow:0 24px 72px var(--shadow);
-        font:13px/1.4 Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-        color-scheme:light
-      }
-      html[data-ytlcc-theme="dark"] #ytlcc-shell,
-      html[data-ytlcc-theme="dark"] #ytlcc-editor-modal .ytlcc-editor-box,
-      html[data-ytlcc-theme="dark"] #ytlcc-pass-modal .ytlcc-pass-box{color-scheme:dark}
-
-      /* HEADER: một hàng cố định, không co giãn chiều cao */
-      .ytlcc-top{
-        height:var(--h-top);display:grid;
-        grid-template-columns:128px minmax(220px,1fr) minmax(180px,320px) 62px 64px 36px;
-        align-items:center;gap:8px;padding:0 9px 0 12px;
-        box-sizing:border-box;background:var(--panel);border-bottom:1px solid var(--line)
-      }
-      .ytlcc-brand{
-        min-width:0;color:var(--accent);font-weight:900;font-size:12px;
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis
-      }
-      .ytlcc-selected{
-        min-width:0;height:30px;display:flex;flex-direction:column;justify-content:center;
-        padding-left:10px;border-left:1px solid var(--line)
-      }
-      #ytlcc-selected-title{
-        min-width:0;font-weight:800;font-size:12.5px;line-height:15px;
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis
-      }
-      #ytlcc-selected-sub{
-        min-width:0;height:13px;margin:0;color:var(--muted);font-size:10.5px;line-height:13px;
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis
-      }
-      #ytlcc-status{
-        height:30px;min-width:0;display:flex;align-items:center;
-        padding:0 9px;box-sizing:border-box;border:1px solid var(--line);border-radius:7px;
-        background:var(--panel2);color:var(--soft);font-size:11px;
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis
-      }
-      #ytlcc-status[data-level="success"]{color:#7db495}
-      #ytlcc-status[data-level="warn"]{color:#d0a36d}
-      #ytlcc-status[data-level="error"]{color:#d68c92}
-
-      /* BODY: sidebar và main cùng baseline */
-      .ytlcc-body{
-        min-height:0;display:grid;grid-template-columns:230px minmax(0,1fr)
-      }
-      .ytlcc-side{
-        min-width:0;min-height:0;display:grid;grid-template-rows:var(--h-tabs) minmax(0,1fr);
-        background:var(--panel);border-right:1px solid var(--line)
-      }
-      .ytlcc-side-head{
-        height:var(--h-tabs);display:flex;align-items:center;justify-content:space-between;
-        gap:8px;padding:0 8px 0 10px;box-sizing:border-box;border-bottom:1px solid var(--line)
-      }
-      .ytlcc-side-title{
-        color:var(--muted);font-size:10px;font-weight:850;letter-spacing:.07em;text-transform:uppercase
-      }
-      .ytlcc-story-list{
-        min-height:0;overflow:auto;padding:6px
-      }
-      .ytlcc-story-row{
-        width:100%;height:50px;margin:0 0 4px;padding:0 9px;
-        display:flex;align-items:center;box-sizing:border-box;
-        border:1px solid transparent;border-radius:7px;
-        background:transparent;color:var(--text);text-align:left;cursor:pointer
-      }
-      .ytlcc-story-row:hover{background:var(--hover)}
-      .ytlcc-story-row.active{background:var(--active);border-color:var(--accent2)}
-      .ytlcc-story-main{min-width:0;width:100%;display:grid;grid-template-rows:17px 14px;align-content:center}
-      .ytlcc-story-main strong{
-        min-width:0;font-size:12px;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis
-      }
-      .ytlcc-story-main span{
-        min-width:0;color:var(--muted);font-size:10px;line-height:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis
-      }
-
-      .ytlcc-main{
-        min-width:0;min-height:0;display:grid;grid-template-rows:var(--h-tabs) minmax(0,1fr)
-      }
-      .ytlcc-tabs{
-        height:var(--h-tabs);display:flex;align-items:center;gap:4px;
-        padding:0 9px;box-sizing:border-box;background:var(--panel);border-bottom:1px solid var(--line);
-        overflow-x:auto;overflow-y:hidden
-      }
-      .ytlcc-tab-btn{
-        height:32px;display:inline-flex;align-items:center;justify-content:center;gap:6px;
-        padding:0 11px;box-sizing:border-box;border:1px solid transparent;border-radius:7px;
-        background:transparent;color:var(--muted);
-        font:760 12px/1 system-ui,sans-serif;white-space:nowrap;cursor:pointer
-      }
-      .ytlcc-tab-btn:hover{background:var(--hover);color:var(--text)}
-      .ytlcc-tab-btn.active{
-        background:var(--active);border-color:var(--accent2);color:var(--text)
-      }
-      .ytlcc-count-badge{
-        height:18px;min-width:19px;padding:0 5px;display:inline-flex;align-items:center;justify-content:center;
-        box-sizing:border-box;border-radius:999px;background:var(--panel3);color:var(--soft);
-        font-size:10px;font-weight:850
-      }
-
-      .ytlcc-content{
-        min-width:0;min-height:0;overflow:auto;padding:10px;box-sizing:border-box;background:var(--bg)
-      }
-      .ytlcc-tab-pane{display:none}
-      .ytlcc-tab-pane.active{display:block}
-
-      /* CONTROLS: mọi nút và input cùng 36px */
-      .ytlcc-btn,.ytlcc-mini,.ytlcc-close,.ytlcc-theme-toggle{
-        height:var(--h-control);box-sizing:border-box;
-        display:inline-flex;align-items:center;justify-content:center;
-        padding:0 11px;border:1px solid var(--line);border-radius:var(--radius);
-        background:var(--panel2);color:var(--text);
-        font:760 12px/1 system-ui,sans-serif;white-space:nowrap;cursor:pointer
-      }
-      .ytlcc-btn:hover,.ytlcc-mini:hover,.ytlcc-close:hover,.ytlcc-theme-toggle:hover{
-        border-color:var(--accent);background:var(--hover)
-      }
-      .ytlcc-btn.primary{background:var(--accent2);border-color:var(--accent2);color:var(--accentText)}
-      .ytlcc-btn.green{background:var(--green2);border-color:var(--green);color:#edf5f0}
-      .ytlcc-btn.red{background:#633e43;border-color:#7b4b51;color:#ead7d9}
-      .ytlcc-btn:disabled,.ytlcc-mini:disabled{opacity:.35;cursor:not-allowed}
-      .ytlcc-mini{height:30px;min-width:50px;padding:0 8px}
-      .ytlcc-close{width:36px;padding:0;font-size:15px}
-      .ytlcc-theme-toggle{width:62px;padding:0}
-      .ytlcc-icon-btn{width:32px;height:30px;padding:0;font-size:15px}
-
-      .ytlcc-toolbar{
-        min-height:36px;display:flex;align-items:center;gap:6px;flex-wrap:nowrap;margin:0 0 8px
-      }
-      .ytlcc-toolbar.compact{margin:0}
-      .ytlcc-spacer{flex:1}
-
-      .ytlcc-input,.ytlcc-select,.ytlcc-textarea{
-        width:100%;box-sizing:border-box;border:1px solid var(--line);
-        border-radius:var(--radius);background:var(--input);color:var(--text);
-        font:12px/1.35 Inter,system-ui,sans-serif;caret-color:var(--accent)
-      }
-      .ytlcc-input,.ytlcc-select{height:var(--h-control);padding:0 9px}
-      .ytlcc-textarea{
-        padding:10px;resize:vertical;font-family:Consolas,ui-monospace,monospace;line-height:1.5
-      }
-      .ytlcc-input:focus,.ytlcc-select:focus,.ytlcc-textarea:focus{
-        outline:0;border-color:var(--accent);box-shadow:0 0 0 2px rgba(139,123,183,.12)
-      }
-      .ytlcc-input::placeholder,.ytlcc-textarea::placeholder{color:var(--muted);opacity:.72}
-      .ytlcc-textarea.ytlcc-drop-active{border-color:var(--accent);background:var(--active)}
-
-      /* PANELS */
-      .ytlcc-card,.ytlcc-panel{
-        background:var(--panel);border:1px solid var(--line);border-radius:9px;color:var(--text)
-      }
-      .ytlcc-card{padding:10px}
-      .ytlcc-card.flat{padding:0;overflow:hidden}
-      .ytlcc-card h3{margin:0;font-size:12px;font-weight:850;color:var(--soft)}
-      .ytlcc-panel{min-width:0;overflow:hidden}
-      .ytlcc-panel-head{
-        height:42px;display:flex;align-items:center;gap:6px;padding:0 8px 0 10px;
-        box-sizing:border-box;border-bottom:1px solid var(--line);background:var(--panel2)
-      }
-      .ytlcc-panel-title{font-size:11px;font-weight:850;color:var(--soft)}
-
-      /* BULK: tuyệt đối không để helper text thay đổi chiều cao control */
-      .ytlcc-bulk-layout{
-        min-width:0;display:grid;grid-template-columns:minmax(0,3fr) minmax(420px,2fr);
-        gap:10px;align-items:start
-      }
-      .ytlcc-bulk-left,.ytlcc-bulk-right{min-width:0}
-      #ytlcc-bulk-input{
-        height:430px;min-height:430px;max-height:430px;
-        border:0;border-radius:0;box-shadow:none;resize:none
-      }
-      .ytlcc-filebar{
-        height:34px;display:flex;align-items:center;gap:6px;
-        padding:0 8px;box-sizing:border-box;border-top:1px solid var(--line);background:var(--panel2)
-      }
-      .ytlcc-meta-chip{
-        min-width:0;max-width:280px;height:22px;display:inline-flex;align-items:center;
-        padding:0 7px;box-sizing:border-box;border:1px solid var(--line);border-radius:999px;
-        background:var(--panel);color:var(--muted);font-size:10px;
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis
-      }
-      .ytlcc-meta-chip:empty{display:none}
-
-      .ytlcc-syncbar{
-        margin-top:8px;padding:8px;display:grid;
-        grid-template-columns:minmax(250px,1fr) 82px minmax(150px,190px) 82px 100px 82px;
-        gap:7px;align-items:end;
-        background:var(--panel);border:1px solid var(--line);border-radius:9px
-      }
-      .ytlcc-field{
-        min-width:0;height:54px;display:grid;grid-template-rows:14px var(--h-control);gap:4px;
-        position:relative
-      }
-      .ytlcc-field>span:first-child{
-        height:14px;line-height:14px;color:var(--muted);
-        font-size:10px;font-weight:820;letter-spacing:.025em
-      }
-      .ytlcc-save-dot{
-        position:absolute;right:6px;top:18px;height:var(--h-control);
-        display:flex;align-items:center;pointer-events:none;
-        color:#7fb395;font-size:0
-      }
-      .ytlcc-save-dot:not(:empty)::after{
-        content:'✓';font-size:11px;font-weight:900
-      }
-      .ytlcc-action-cell{
-        height:54px;display:flex;align-items:flex-end
-      }
-      .ytlcc-action-cell>.ytlcc-btn{width:100%}
-      .ytlcc-sync-main{width:100%}
-
-      /* TABLES */
-      .ytlcc-table-wrap{
-        min-width:0;overflow:auto;background:var(--panel);
-        border:1px solid var(--line);border-radius:8px
-      }
-      .ytlcc-panel>.ytlcc-table-wrap,.ytlcc-card.flat>.ytlcc-table-wrap{
-        border:0;border-radius:0
-      }
-      .ytlcc-bulk-right .ytlcc-table-wrap{height:472px}
-      .ytlcc-table{
-        width:100%;border-collapse:collapse;table-layout:auto;color:var(--text);font-size:12px
-      }
-      .ytlcc-table th,.ytlcc-table td{
-        height:38px;box-sizing:border-box;padding:0 8px;
-        border-bottom:1px solid var(--line2);text-align:left;white-space:nowrap;vertical-align:middle
-      }
-      .ytlcc-table th{
-        position:sticky;top:0;z-index:1;background:var(--panel2);color:var(--muted);
-        font-size:10px;font-weight:850;letter-spacing:.025em;text-transform:uppercase
-      }
-      .ytlcc-table tbody tr:hover{background:var(--hover)}
-      .ytlcc-title-cell{max-width:460px;overflow:hidden;text-overflow:ellipsis}
-      .ytlcc-empty{padding:24px!important;text-align:center!important;color:var(--muted);font-size:11px}
-      .ytlcc-muted{color:var(--muted);font-size:10px}
-      .ytlcc-mt{margin-top:8px}
-      .ytlcc-h-badge{
-        min-width:20px;height:18px;padding:0 5px;display:inline-flex;align-items:center;justify-content:center;
-        border-radius:999px;background:#3a2529;color:#d9979c;border:1px solid #654047;
-        font-size:10px;font-weight:900
-      }
-
-      /* OVERVIEW + STATS */
-      .ytlcc-overview{
-        display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px
-      }
-      .ytlcc-kpi,.ytlcc-stat{
-        min-width:0;height:72px;box-sizing:border-box;
-        display:flex;flex-direction:column;justify-content:center;gap:3px;
-        padding:9px 11px;background:var(--panel);border:1px solid var(--line);border-radius:8px
-      }
-      .ytlcc-kpi span,.ytlcc-stat span{
-        color:var(--muted);font-size:10px;line-height:13px
-      }
-      .ytlcc-kpi strong,.ytlcc-stat strong{
-        min-width:0;color:var(--text);font-size:15px;line-height:20px;
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis
-      }
-      .ytlcc-stat strong{color:var(--accent)}
-      .ytlcc-stat-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px}
-      .ytlcc-series>div{
-        height:32px;display:flex;align-items:center;justify-content:space-between;
-        border-bottom:1px solid var(--line2)
-      }
-
-      /* LOG */
-      #ytlcc-log{
-        height:calc(100vh - 160px);min-height:360px;overflow:auto;
-        padding:9px;box-sizing:border-box;background:var(--code);color:var(--codeText);
-        border:1px solid var(--line);border-radius:8px;
-        font:11.5px/1.5 Consolas,ui-monospace,monospace
-      }
-      .ytlcc-log-line{padding:2px 0;border-bottom:1px solid rgba(150,160,175,.07)}
-      .ytlcc-log-line.warn{color:#d5b17a}
-      .ytlcc-log-line.error{color:#d4898f}
-      .ytlcc-log-line.success{color:#8ebda0}
-
-      /* TOAST */
-      #ytlcc-toast-host{
-        position:fixed;top:14px;right:14px;z-index:2147483647;
-        display:flex;flex-direction:column;gap:6px;max-width:390px
-      }
-      .ytlcc-toast{
-        padding:8px 10px;border:1px solid #3a4452;border-radius:8px;
-        background:#252c36;color:#d9dee6;box-shadow:0 10px 30px rgba(0,0,0,.3);
-        transition:.18s;font-size:12px
-      }
-      .ytlcc-toast.success{background:#294437;color:#cfe2d6;border-color:#456957}
-      .ytlcc-toast.warn{background:#493923;color:#ead7b8;border-color:#70583a}
-      .ytlcc-toast.error{background:#4b2b2e;color:#ead0d2;border-color:#74464a}
-      .ytlcc-toast.out{opacity:0;transform:translateX(16px)}
-
-      /* EDITOR */
-      #ytlcc-editor-modal{
-        display:none;position:fixed;inset:0;z-index:2147483640;padding:16px;
-        background:rgba(7,10,14,.84);align-items:center;justify-content:center
-      }
-      #ytlcc-editor-modal.show{display:flex}
-      .ytlcc-editor-box{
-        width:min(980px,100%);max-height:92vh;overflow:hidden;
-        display:grid;grid-template-rows:46px auto minmax(320px,55vh) 52px;
-        padding:0;background:var(--panel);color:var(--text);
-        border:1px solid var(--line);border-radius:10px;box-shadow:0 24px 70px var(--shadow)
-      }
-      .ytlcc-editor-head{
-        height:46px;display:flex;align-items:center;gap:8px;padding:0 9px 0 11px;
-        box-sizing:border-box;border-bottom:1px solid var(--line)
-      }
-      .ytlcc-editor-fields{
-        display:grid;grid-template-columns:88px minmax(240px,1fr) 90px 160px;
-        gap:7px;padding:9px
-      }
-      #ytlcc-edit-content{
-        width:100%;height:100%;min-height:0;border-radius:0;border-left:0;border-right:0;resize:none
-      }
-      .ytlcc-editor-foot{
-        height:52px;display:flex;align-items:center;justify-content:flex-end;gap:7px;padding:0 9px
-      }
-
-      /* BULK PASS */
-      #ytlcc-pass-modal{
-        display:none;position:fixed;inset:0;z-index:2147483642;
-        padding:16px;background:rgba(7,10,14,.84);
-        align-items:center;justify-content:center
-      }
-      #ytlcc-pass-modal.show{display:flex}
-      .ytlcc-pass-box{
-        width:min(470px,100%);overflow:hidden;
-        background:var(--panel);color:var(--text);
-        border:1px solid var(--line);border-radius:10px;
-        box-shadow:0 24px 70px var(--shadow)
-      }
-      .ytlcc-pass-head{
-        height:46px;display:flex;align-items:center;gap:8px;
-        padding:0 9px 0 11px;box-sizing:border-box;
-        border-bottom:1px solid var(--line)
-      }
-      .ytlcc-pass-body{
-        display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:12px
-      }
-      .ytlcc-pass-foot{
-        height:54px;display:flex;align-items:center;justify-content:flex-end;
-        gap:7px;padding:0 12px;border-top:1px solid var(--line)
-      }
-
-      #ytlcc-shell *{scrollbar-width:thin;scrollbar-color:var(--line) transparent}
-      #ytlcc-shell *::-webkit-scrollbar{width:9px;height:9px}
-      #ytlcc-shell *::-webkit-scrollbar-thumb{
-        background:var(--line);border:2px solid transparent;background-clip:padding-box;border-radius:999px
-      }
-
-      @media(max-width:1180px){
-        .ytlcc-bulk-layout{grid-template-columns:1fr}
-        .ytlcc-bulk-right .ytlcc-table-wrap{height:360px}
-        .ytlcc-syncbar{
-          grid-template-columns:minmax(230px,1fr) 82px minmax(150px,1fr) 82px 100px 82px
-        }
-        .ytlcc-stat-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
-      }
-
-      @media(max-width:900px){
-        #ytlcc-overlay{padding:0}
-        #ytlcc-shell{height:100vh;border-radius:0}
-        .ytlcc-top{
-          grid-template-columns:100px minmax(160px,1fr) 62px 36px
-        }
-        #ytlcc-status,#ytlcc-cancel-run{display:none}
-        .ytlcc-body{grid-template-columns:190px minmax(0,1fr)}
-        .ytlcc-syncbar{grid-template-columns:1fr 82px 1fr 82px}
-        .ytlcc-action-cell{height:36px}
-        .ytlcc-overview{grid-template-columns:repeat(2,minmax(0,1fr))}
-        .ytlcc-editor-fields{grid-template-columns:1fr 1fr}
-      }
-    `;
+    style.id = 'ttlcc-style';
+    style.textContent = CSS_TEXT;
     document.head.appendChild(style);
-  }
 
-  function mountUi() {
-    injectCss();
+    const panel = document.createElement('div');
+    panel.id = 'ttlcc-panel';
+    panel.innerHTML = `
+      <div class="ttlcc-head" id="ttlcc-head">
+        <div class="ttlcc-head-main">
+          <div class="ttlcc-head-title">Trích Tinh Lâu · Control Center</div>
+          <div class="ttlcc-head-sub">v${VERSION} · form/route live-adapter · không hardcode vị trí cột</div>
+        </div>
+        <div class="ttlcc-head-actions">
+          <span class="ttlcc-badge" id="ttlcc-story-badge">—</span>
+          <button class="ttlcc-icon" id="ttlcc-refresh-all" type="button" title="Refresh">↻</button>
+          <button class="ttlcc-icon" id="ttlcc-minimize" type="button" title="Thu gọn">−</button>
+        </div>
+      </div>
 
-    const launch = document.createElement('button');
-    launch.id = 'ytlcc-launch';
-    launch.type = 'button';
-    launch.textContent = 'YTL Control';
-    document.body.appendChild(launch);
+      <div class="ttlcc-selection">
+        <div class="ttlcc-selection-main">
+          <div class="ttlcc-selected-title" id="ttlcc-selected-title">Chưa chọn truyện</div>
+          <div class="ttlcc-selected-sub" id="ttlcc-selected-sub">Đang khởi tạo…</div>
+        </div>
+        <div id="ttlcc-status" class="ttlcc-status">Đang khởi tạo…</div>
+      </div>
 
-    const overlay = document.createElement('div');
-    overlay.id = 'ytlcc-overlay';
-    overlay.innerHTML = `
-      <div id="ytlcc-shell">
-        <header class="ytlcc-top">
-          <div class="ytlcc-brand">YTL ${VERSION}</div>
+      <div class="ttlcc-tabs">
+        <button class="ttlcc-tab-btn active" data-tab="dashboard" type="button">Tổng quan</button>
+        <button class="ttlcc-tab-btn" data-tab="stories" type="button">Truyện</button>
+        <button class="ttlcc-tab-btn" data-tab="chapters" type="button">Chương</button>
+        <button class="ttlcc-tab-btn" data-tab="bulk" type="button">Bulk</button>
+        <button class="ttlcc-tab-btn" data-tab="revenue" type="button">Doanh thu</button>
+        <button class="ttlcc-tab-btn" data-tab="log" type="button">Log</button>
+      </div>
 
-          <div class="ytlcc-selected">
-            <div id="ytlcc-selected-title">Chưa chọn truyện</div>
-            <div id="ytlcc-selected-sub"></div>
+      <div class="ttlcc-main">
+        <section class="ttlcc-pane active" data-pane="dashboard">
+          <div class="ttlcc-stats">
+            <div class="ttlcc-stat"><div class="ttlcc-stat-label">Truyện đang chọn</div><div class="ttlcc-stat-value" id="ttlcc-stat-story">—</div></div>
+            <div class="ttlcc-stat"><div class="ttlcc-stat-label">Tổng chương</div><div class="ttlcc-stat-value" id="ttlcc-stat-chapters">0</div></div>
+            <div class="ttlcc-stat"><div class="ttlcc-stat-label">Miễn phí</div><div class="ttlcc-stat-value" id="ttlcc-stat-free">0</div></div>
+            <div class="ttlcc-stat"><div class="ttlcc-stat-label">Trả Sao</div><div class="ttlcc-stat-value" id="ttlcc-stat-stars">0</div></div>
+            <div class="ttlcc-stat"><div class="ttlcc-stat-label">Trả KC</div><div class="ttlcc-stat-value" id="ttlcc-stat-diamonds">0</div></div>
+          </div>
+          <div id="ttlcc-dashboard-warning" class="ttlcc-warning" style="display:none"></div>
+          <div class="ttlcc-card" style="margin-top:12px">
+            <div class="ttlcc-card-title">
+              <span>Kiểm tra nhanh</span>
+              <span class="ttlcc-badge">Short-paid: <span id="ttlcc-stat-shortpaid">0</span></span>
+            </div>
+            <div class="ttlcc-head-sub" style="color:var(--ttlcc-muted)">
+              Dashboard chỉ hiển thị trạng thái. Thao tác thật nằm đúng một nơi ở tab Truyện, Chương, Bulk hoặc Doanh thu.
+            </div>
+          </div>
+        </section>
+
+        <section class="ttlcc-pane" data-pane="stories">
+          <div class="ttlcc-grid2">
+            <div class="ttlcc-card">
+              <div class="ttlcc-card-title"><span>Danh sách truyện</span></div>
+              <div class="ttlcc-toolbar">
+                <input class="ttlcc-input" id="ttlcc-story-filter" type="text" placeholder="Lọc tên / ID…" style="flex:1;min-width:120px">
+                <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-story-server-search" type="button">Tìm server</button>
+                <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-story-reload" type="button">↻</button>
+              </div>
+              <div class="ttlcc-story-list" id="ttlcc-story-list" style="margin-top:8px"></div>
+            </div>
+            <div class="ttlcc-card">
+              <div class="ttlcc-card-title">
+                <span>Thông tin truyện</span>
+                <div class="ttlcc-toolbar">
+                  <button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" id="ttlcc-edit-story" type="button">Nạp form sửa</button>
+                  <button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" id="ttlcc-publish-story" type="button">Publish / Tạm ẩn</button>
+                </div>
+              </div>
+              <div id="ttlcc-story-editor" class="ttlcc-empty">Chọn truyện rồi bấm “Nạp form sửa”.</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="ttlcc-pane" data-pane="chapters">
+          <div class="ttlcc-card">
+            <div class="ttlcc-card-title">
+              <span>Danh sách chương</span>
+              <div class="ttlcc-toolbar">
+                <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-create-chapter" type="button">+ Chương mới</button>
+                <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-chapter-reload" type="button">Quét server</button>
+              </div>
+            </div>
+            <div class="ttlcc-toolbar">
+              <input class="ttlcc-input" id="ttlcc-chapter-filter" type="text" placeholder="Tên / slug / số chương…" style="min-width:230px">
+              <label><input id="ttlcc-chapter-paid" type="checkbox"> Chỉ trả phí</label>
+              <label><input id="ttlcc-chapter-short" type="checkbox"> Chỉ &lt;1000 từ</label>
+            </div>
+            <div class="ttlcc-table-wrap" style="margin-top:9px">
+              <table class="ttlcc-table">
+                <thead><tr><th>#</th><th>Tên chương</th><th>Trạng thái</th><th>Slug</th><th>Số từ</th><th>Pass</th><th>Mở khóa</th><th>Thao tác</th></tr></thead>
+                <tbody id="ttlcc-chapter-body"><tr><td colspan="8" class="ttlcc-empty">Chưa tải chương.</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="ttlcc-pane" data-pane="bulk">
+          <div class="ttlcc-bulk-layout">
+            <div>
+              <div class="ttlcc-card">
+                <div class="ttlcc-card-title">Bulk engine</div>
+                <div class="ttlcc-field">
+                  <div class="ttlcc-label">Tác vụ</div>
+                  <select id="ttlcc-bulk-operation">
+                    <option value="price_update">Fix giá CHƯƠNG cũ</option>
+                    <option value="both">Cập nhật tên + nội dung</option>
+                    <option value="title">Chỉ đổi tên</option>
+                    <option value="content">Chỉ cập nhật nội dung</option>
+                    <option value="create">Đăng CHƯƠNG mới</option>
+                  </select>
+                </div>
+                <div class="ttlcc-grid3" style="margin-top:8px">
+                  <div class="ttlcc-field"><div class="ttlcc-label">Từ chương</div><input id="ttlcc-bulk-from" type="number" min="1"></div>
+                  <div class="ttlcc-field"><div class="ttlcc-label">Đến chương</div><input id="ttlcc-bulk-to" type="number" min="1"></div>
+                  <div class="ttlcc-field"><div class="ttlcc-label">Delay ms</div><input id="ttlcc-bulk-delay" type="number" min="0" step="100" value="1100"></div>
+                </div>
+                <div class="ttlcc-toolbar" style="margin-top:8px">
+                  <label><input id="ttlcc-bulk-verify" type="checkbox" checked> Re-check sau lưu</label>
+                  <label><input id="ttlcc-bulk-stop-error" type="checkbox" checked> Dừng khi lỗi</label>
+                </div>
+              </div>
+
+              <div class="ttlcc-card" id="ttlcc-bulk-txt-card" style="display:none">
+                <div class="ttlcc-card-title"><span>TXT · nhiều file</span><span class="ttlcc-badge">CHƯƠNG X: Tên</span></div>
+                <input id="ttlcc-bulk-file" type="file" accept=".txt,text/plain" multiple>
+                <textarea id="ttlcc-bulk-text" class="ttlcc-textarea" placeholder="CHƯƠNG 96: Tên chương\n\nNội dung…"></textarea>
+                <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-bulk-parse" type="button" style="margin-top:8px">Phân tích TXT</button>
+              </div>
+
+              <div class="ttlcc-card" id="ttlcc-price-card">
+                <div class="ttlcc-card-title">Giá mở khóa</div>
+                <div class="ttlcc-grid3">
+                  <div class="ttlcc-field"><div class="ttlcc-label">Từ</div><input id="ttlcc-price-from" type="number" min="1"></div>
+                  <div class="ttlcc-field"><div class="ttlcc-label">Đến</div><input id="ttlcc-price-to" type="number" min="1"></div>
+                  <div class="ttlcc-field"><div class="ttlcc-label">Loại</div><select id="ttlcc-price-type"><option value="free">FREE</option><option value="stars">Sao</option><option value="diamond">KC</option></select></div>
+                </div>
+                <div class="ttlcc-toolbar" style="margin-top:8px">
+                  <input id="ttlcc-price-value" type="number" min="1" max="10" value="5" style="width:75px">
+                  <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-price-apply" type="button">Áp dụng</button>
+                  <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-price-alt-star" type="button">Sao → KC</button>
+                  <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-price-alt-kc" type="button">KC → Sao</button>
+                </div>
+                <div class="ttlcc-head-sub" style="margin-top:8px;color:var(--ttlcc-muted)">Dưới 1000 từ bị ép FREE. Sao 1–10. KC cố định 1.</div>
+              </div>
+            </div>
+
+            <div class="ttlcc-card">
+              <div class="ttlcc-card-title"><span>Preview / Re-check</span><span id="ttlcc-bulk-summary" class="ttlcc-badge">Chưa có dữ liệu</span></div>
+              <div class="ttlcc-table-wrap" style="max-height:430px">
+                <table class="ttlcc-table">
+                  <thead><tr><th>Ch.</th><th>Tên</th><th>Số từ</th><th>Giá</th><th>Trạng thái</th></tr></thead>
+                  <tbody id="ttlcc-bulk-preview"></tbody>
+                </table>
+              </div>
+              <div class="ttlcc-toolbar" style="margin-top:10px;justify-content:flex-end">
+                <button class="ttlcc-btn ttlcc-btn-danger" id="ttlcc-bulk-cancel" type="button" disabled>Hủy</button>
+                <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-bulk-run" type="button">Chạy batch</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="ttlcc-pane" data-pane="revenue">
+          <div class="ttlcc-revenue-top">
+            <div class="ttlcc-revenue-summary">
+              <div class="ttlcc-revenue-summary-label">Có thể rút</div>
+              <div class="ttlcc-revenue-summary-value" id="ttlcc-revenue-withdrawable">—</div>
+              <div class="ttlcc-revenue-summary-sub" id="ttlcc-revenue-withdrawable-sub">Số dư khả dụng: —</div>
+            </div>
+
+            <div class="ttlcc-revenue-summary">
+              <div class="ttlcc-revenue-summary-label">Tổng KC đã thu</div>
+              <div class="ttlcc-revenue-summary-value" id="ttlcc-revenue-total">—</div>
+              <div class="ttlcc-revenue-summary-sub" id="ttlcc-revenue-total-sub">— lượt bán</div>
+            </div>
+
+            <div class="ttlcc-revenue-summary">
+              <div class="ttlcc-revenue-summary-label">Tháng này</div>
+              <div class="ttlcc-revenue-summary-value" id="ttlcc-revenue-month">—</div>
+              <div class="ttlcc-revenue-summary-sub" id="ttlcc-revenue-period">Kỳ hiện tại</div>
+            </div>
           </div>
 
-          <div id="ytlcc-status">Khởi động...</div>
-          <button id="ytlcc-theme-toggle" class="ytlcc-theme-toggle" type="button" aria-pressed="true">Night</button>
-          <button id="ytlcc-cancel-run" class="ytlcc-btn red" type="button" disabled>Hủy</button>
-          <button id="ytlcc-close" class="ytlcc-close" type="button" title="Đóng">×</button>
-        </header>
-
-        <div class="ytlcc-body">
-          <aside class="ytlcc-side">
-            <div class="ytlcc-side-head">
-              <span class="ytlcc-side-title">Truyện</span>
-              <button id="ytlcc-refresh-stories" class="ytlcc-btn ytlcc-icon-btn" type="button" title="Tải lại">↻</button>
+          <div class="ttlcc-card">
+            <div class="ttlcc-revenue-toolbar">
+              <div>
+                <div class="ttlcc-card-title" style="margin:0">Doanh thu theo truyện</div>
+                <div class="ttlcc-revenue-meta" id="ttlcc-revenue-meta"></div>
+              </div>
+              <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-revenue-refresh" type="button">↻ Refresh</button>
             </div>
 
-            <div id="ytlcc-story-list" class="ytlcc-story-list">
-              <div class="ytlcc-empty">Đang tải...</div>
+            <div class="ttlcc-revenue-story-list" id="ttlcc-revenue-stories">
+              <div class="ttlcc-empty">Mở tab để tải doanh thu.</div>
             </div>
-          </aside>
+          </div>
+        </section>
 
-          <main class="ytlcc-main">
-            <nav class="ytlcc-tabs">
-              <button class="ytlcc-tab-btn" data-tab="stories" type="button">Tổng quan</button>
-              <button class="ytlcc-tab-btn" data-tab="chapters" type="button">
-                Chương
-                <span id="ytlcc-chapter-count" class="ytlcc-count-badge">0</span>
-              </button>
-              <button class="ytlcc-tab-btn" data-tab="bulk" type="button">Đồng bộ</button>
-              <button class="ytlcc-tab-btn" data-tab="stats" type="button">Doanh thu</button>
-              <button class="ytlcc-tab-btn" data-tab="log" type="button">Log</button>
-            </nav>
-
-            <div class="ytlcc-content">
-              <section class="ytlcc-tab-pane" data-pane="stories">
-                <div class="ytlcc-overview">
-                  <div class="ytlcc-kpi">
-                    <span>Truyện</span>
-                    <strong id="ytlcc-overview-story">Đang chọn</strong>
-                  </div>
-                  <div class="ytlcc-kpi">
-                    <span>Chương</span>
-                    <strong id="ytlcc-overview-chapters">0</strong>
-                  </div>
-                  <div class="ytlcc-kpi">
-                    <span>Đồng bộ</span>
-                    <strong>TXT Smart Sync</strong>
-                  </div>
-                  <div class="ytlcc-kpi">
-                    <span>Phiên bản</span>
-                    <strong>${VERSION}</strong>
-                  </div>
-                </div>
-              </section>
-
-              <section class="ytlcc-tab-pane" data-pane="chapters">
-                <div class="ytlcc-toolbar">
-                  <button id="ytlcc-refresh-chapters" class="ytlcc-btn primary" type="button">Làm mới</button>
-                  <button id="ytlcc-download-txt" class="ytlcc-btn" type="button">Tải TXT</button>
-                  <button id="ytlcc-open-pass-bulk" data-run-action class="ytlcc-btn" type="button">Pass hàng loạt</button>
-                </div>
-
-                <div class="ytlcc-table-wrap">
-                  <table class="ytlcc-table">
-                    <thead>
-                      <tr>
-                        <th>Ch.</th><th>Tiêu đề</th><th>Từ</th><th>View</th><th>KC</th><th>Status</th><th></th>
-                      </tr>
-                    </thead>
-                    <tbody id="ytlcc-chapter-body">
-                      <tr><td colspan="7" class="ytlcc-empty">Chưa có dữ liệu.</td></tr>
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-
-              <section class="ytlcc-tab-pane" data-pane="bulk">
-                <div class="ytlcc-bulk-layout">
-                  <div class="ytlcc-bulk-left">
-                    <div class="ytlcc-panel">
-                      <div class="ytlcc-panel-head">
-                        <span class="ytlcc-panel-title">TXT</span>
-                        <span class="ytlcc-spacer"></span>
-
-                        <input id="ytlcc-txt-file" type="file" accept=".txt,text/plain" multiple hidden>
-                        <button id="ytlcc-load-txt" class="ytlcc-btn" type="button">Nạp nhiều TXT</button>
-                        <button id="ytlcc-bulk-parse" class="ytlcc-btn" type="button">Phân tích</button>
-                      </div>
-
-                      <textarea
-                        id="ytlcc-bulk-input"
-                        class="ytlcc-textarea"
-                        placeholder="Chương 11: Tên chương&#10;&#10;Nội dung...&#10;&#10;Chương 12: Tên chương&#10;&#10;Nội dung..."
-                      ></textarea>
-
-                      <div class="ytlcc-filebar">
-                        <span id="ytlcc-txt-file-name" class="ytlcc-meta-chip"></span>
-                        <span id="ytlcc-bulk-summary" class="ytlcc-meta-chip"></span>
-                      </div>
-                    </div>
-
-                    <div class="ytlcc-syncbar">
-                      <label class="ytlcc-field">
-                        <span>Chế độ</span>
-                        <select id="ytlcc-sync-mode" class="ytlcc-select">
-                          <option value="upsert" selected>Có thì cập nhật, thiếu thì đăng</option>
-                          <option value="missing_only">Chỉ đăng chương còn thiếu</option>
-                          <option value="existing_only">Chỉ cập nhật chương đã có</option>
-                        </select>
-                      </label>
-
-                      <label class="ytlcc-field">
-                        <span>KC</span>
-                        <input id="ytlcc-bulk-price" class="ytlcc-input" type="number" min="0" value="0">
-                      </label>
-
-                      <label class="ytlcc-field">
-                        <span>Pass H</span>
-                        <input id="ytlcc-h-password" class="ytlcc-input" type="text" value="" autocomplete="off" placeholder="Pass">
-                        <span id="ytlcc-h-pass-saved" class="ytlcc-save-dot"></span>
-                      </label>
-
-                      <label class="ytlcc-field">
-                        <span>Delay</span>
-                        <input id="ytlcc-bulk-delay" class="ytlcc-input" type="number" min="180" value="${CFG.writeGapMs}">
-                      </label>
-
-                      <div class="ytlcc-action-cell">
-                        <button id="ytlcc-smart-sync" data-run-action class="ytlcc-btn green ytlcc-sync-main" type="button">Đồng bộ</button>
-                      </div>
-
-                      <div class="ytlcc-action-cell">
-                        <button id="ytlcc-update-price" data-run-action class="ytlcc-btn" type="button">Đặt giá</button>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div class="ytlcc-bulk-right">
-                    <div class="ytlcc-panel">
-                      <div class="ytlcc-panel-head">
-                        <span class="ytlcc-panel-title">Preview</span>
-                      </div>
-
-                      <div class="ytlcc-table-wrap">
-                        <table class="ytlcc-table">
-                          <thead>
-                            <tr><th>Ch.</th><th>Tiêu đề</th><th>Ký tự</th><th>H</th><th>Server</th></tr>
-                          </thead>
-                          <tbody id="ytlcc-bulk-preview-body">
-                            <tr><td colspan="5" class="ytlcc-empty">Chưa phân tích.</td></tr>
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </section>
-
-              <section class="ytlcc-tab-pane" data-pane="stats">
-                <div class="ytlcc-toolbar">
-                  <button id="ytlcc-load-stats" class="ytlcc-btn primary" type="button">Làm mới</button>
-                </div>
-                <div id="ytlcc-stats">
-                  <div class="ytlcc-empty">Chưa tải dữ liệu.</div>
-                </div>
-              </section>
-
-              <section class="ytlcc-tab-pane" data-pane="log">
-                <div class="ytlcc-toolbar">
-                  <button id="ytlcc-clear-log" class="ytlcc-btn" type="button">Xóa</button>
-                </div>
-                <div id="ytlcc-log"></div>
-              </section>
-            </div>
-          </main>
-        </div>
+        <section class="ttlcc-pane" data-pane="log">
+          <div class="ttlcc-card">
+            <div class="ttlcc-card-title"><span>Nhật ký</span><button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" id="ttlcc-log-clear" type="button">Xóa log</button></div>
+            <div id="ttlcc-log" class="ttlcc-log"></div>
+          </div>
+        </section>
       </div>
     `;
+    document.body.appendChild(panel);
 
-    document.body.appendChild(overlay);
+    const modal = document.createElement('div');
+    modal.id = 'ttlcc-modal';
+    modal.innerHTML = `
+      <div class="ttlcc-modal-box">
+        <div class="ttlcc-modal-head"><span id="ttlcc-modal-title">Modal</span><button class="ttlcc-icon" id="ttlcc-modal-close" type="button">×</button></div>
+        <div class="ttlcc-modal-body" id="ttlcc-modal-body"></div>
+      </div>`;
+    document.body.appendChild(modal);
 
     const toastHost = document.createElement('div');
-    toastHost.id = 'ytlcc-toast-host';
+    toastHost.id = 'ttlcc-toast-host';
     document.body.appendChild(toastHost);
 
-    const editor = document.createElement('div');
-    editor.id = 'ytlcc-editor-modal';
-    editor.innerHTML = `
-      <div class="ytlcc-editor-box">
-        <div class="ytlcc-editor-head">
-          <strong style="flex:1">Sửa chương</strong>
-          <button id="ytlcc-editor-close" class="ytlcc-close" type="button">×</button>
-        </div>
-
-        <div class="ytlcc-editor-fields">
-          <label class="ytlcc-field">
-            <span>Chương</span>
-            <input id="ytlcc-edit-no" class="ytlcc-input" type="text" readonly>
-          </label>
-
-          <label class="ytlcc-field">
-            <span>Tiêu đề</span>
-            <input id="ytlcc-edit-title" class="ytlcc-input" type="text">
-          </label>
-
-          <label class="ytlcc-field">
-            <span>KC</span>
-            <input id="ytlcc-edit-price" class="ytlcc-input" type="number" min="0">
-          </label>
-
-          <label class="ytlcc-field">
-            <span>Pass</span>
-            <input id="ytlcc-edit-password" class="ytlcc-input" type="text">
-          </label>
-        </div>
-
-        <textarea id="ytlcc-edit-content" class="ytlcc-textarea"></textarea>
-
-        <div class="ytlcc-editor-foot">
-          <button id="ytlcc-editor-save" class="ytlcc-btn green" type="button">Lưu</button>
-        </div>
-      </div>
-    `;
-
-    document.body.appendChild(editor);
-
-    const passModal = document.createElement('div');
-    passModal.id = 'ytlcc-pass-modal';
-    passModal.innerHTML = `
-      <div class="ytlcc-pass-box">
-        <div class="ytlcc-pass-head">
-          <strong style="flex:1">Pass hàng loạt</strong>
-          <button id="ytlcc-pass-close" class="ytlcc-close" type="button">×</button>
-        </div>
-
-        <div class="ytlcc-pass-body">
-          <label class="ytlcc-field">
-            <span>Chương</span>
-            <input
-              id="ytlcc-pass-range"
-              class="ytlcc-input"
-              type="text"
-              value="H"
-              autocomplete="off"
-              placeholder="H hoặc 15,18-22,30"
-            >
-          </label>
-
-          <label class="ytlcc-field">
-            <span>Pass</span>
-            <input
-              id="ytlcc-pass-value"
-              class="ytlcc-input"
-              type="text"
-              value=""
-              autocomplete="off"
-              placeholder="Pass mới"
-            >
-          </label>
-        </div>
-
-        <div class="ytlcc-pass-foot">
-          <button id="ytlcc-pass-clear" data-run-action class="ytlcc-btn red" type="button">Xóa pass</button>
-          <span class="ytlcc-spacer"></span>
-          <button id="ytlcc-pass-cancel" class="ytlcc-btn" type="button">Hủy</button>
-          <button id="ytlcc-pass-apply" data-run-action class="ytlcc-btn green" type="button">Áp dụng</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(passModal);
-
-    bindUi();
-  }
-
-  async function init() {
-    mountUi();
+    bindUiEvents();
 
     const prefs = loadPrefs();
-    if (prefs.selectedStoryId) {
-      state.selectedStoryId = Number(prefs.selectedStoryId);
-    }
-    if (prefs.activeTab) {
-      state.activeTab = prefs.activeTab;
+    if (prefs.minimized) panel.classList.add('ttlcc-minimized');
+    if (prefs.activeTab) switchTab(prefs.activeTab);
+  }
+
+  function switchTab(tab) {
+    state.activeTab = tab;
+    $$('.ttlcc-tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+    $$('.ttlcc-pane').forEach(p => p.classList.toggle('active', p.dataset.pane === tab));
+
+    if (tab === 'revenue') {
+      renderRevenue();
+
+      if (!state.revenue.loaded) {
+        loadRevenueData().catch(() => {});
+      }
     }
 
-    state.bulk.hPassword = String(prefs.hPassword || '');
-    const hPasswordInput = $('#ytlcc-h-password');
-    if (hPasswordInput) {
-      hPasswordInput.value = state.bulk.hPassword;
-    }
-    const bulkPassInput = $('#ytlcc-pass-value');
-    if (bulkPassInput) {
-      bulkPassInput.value = state.bulk.hPassword;
+    savePrefs();
+  }
+
+  function syncBulkOperationUi() {
+    const op = bulkOperation();
+    state.bulk.operation = op;
+    const txt = $('#ttlcc-bulk-txt-card');
+    const price = $('#ttlcc-price-card');
+    if (txt) txt.style.display = op === 'price_update' ? 'none' : '';
+    if (price) price.style.display = ['price_update', 'create'].includes(op) ? '' : 'none';
+
+    if (op === 'price_update') {
+      // Chuyển vào Fix giá => lấy server hiện tại làm baseline mới.
+      initializeExistingPricing(true);
+      const nums = state.chapters.map(x => x.chapterNo);
+      if (nums.length) {
+        const min = Math.min(...nums), max = Math.max(...nums);
+        $('#ttlcc-bulk-from').value = min;
+        $('#ttlcc-bulk-to').value = max;
+        $('#ttlcc-price-from').value = min;
+        $('#ttlcc-price-to').value = max;
+      }
+    } else if (state.bulk.parsed.length) {
+      const nums = state.bulk.parsed.map(x => x.chapterNo);
+      $('#ttlcc-bulk-from').value = Math.min(...nums);
+      $('#ttlcc-bulk-to').value = Math.max(...nums);
+      $('#ttlcc-price-from').value = Math.min(...nums);
+      $('#ttlcc-price-to').value = Math.max(...nums);
     }
 
-    state.theme = prefs.theme === 'light' ? 'light' : 'dark';
-    applyTheme(state.theme);
+    renderBulkPreview();
+  }
 
-    tab(state.activeTab || 'stories');
-    renderRunState();
+  function bindUiEvents() {
+    $$('.ttlcc-tab-btn').forEach(btn => btn.onclick = () => switchTab(btn.dataset.tab));
+
+    $('#ttlcc-minimize').onclick = e => {
+      // Quan trọng: chặn click bubble lên header, nếu không header sẽ
+      // mở panel trở lại ngay trong cùng một click.
+      e.preventDefault();
+      e.stopPropagation();
+
+      $('#ttlcc-panel').classList.add('ttlcc-minimized');
+      savePrefs();
+    };
+
+    $('#ttlcc-head').addEventListener('click', e => {
+      const panel = $('#ttlcc-panel');
+
+      // Khi đã thu nhỏ, click vào pill/header mini sẽ mở lại.
+      if (panel.classList.contains('ttlcc-minimized')) {
+        panel.classList.remove('ttlcc-minimized');
+        savePrefs();
+      }
+    });
+
+    $('#ttlcc-refresh-all').onclick = async () => {
+      try {
+        await loadStories();
+        if (state.selectedStoryId) await loadChapters();
+        toast('Refresh toàn bộ hoàn tất.', 'ok');
+      } catch (err) {
+        toast(`Refresh lỗi: ${err.message}`, 'error', 6000);
+      }
+    };
+
+    $('#ttlcc-story-filter').addEventListener('input', renderStoryList);
+    $('#ttlcc-story-reload').onclick = () => loadStories().catch(err => toast(err.message, 'error'));
+    $('#ttlcc-story-server-search').onclick = () => {
+      const q = $('#ttlcc-story-filter').value.trim();
+      if (!q) return loadStories();
+      loadStories({ serverSearch: true, query: q }).catch(err => toast(`Tìm server lỗi: ${err.message}`, 'error'));
+    };
+    $('#ttlcc-edit-story').onclick = () => loadStoryEditor();
+    $('#ttlcc-publish-story').onclick = togglePublishSelected;
+
+    $('#ttlcc-chapter-filter').addEventListener('input', renderChapters);
+    $('#ttlcc-chapter-paid').addEventListener('change', renderChapters);
+    $('#ttlcc-chapter-short').addEventListener('change', renderChapters);
+    $('#ttlcc-create-chapter').onclick = openCreateChapter;
+    $('#ttlcc-chapter-reload').onclick = () => loadChapters().catch(err => toast(err.message, 'error'));
+
+    $('#ttlcc-bulk-operation').onchange = syncBulkOperationUi;
+    $('#ttlcc-bulk-from').oninput = () => {
+      if (['price_update', 'create'].includes(bulkOperation())) $('#ttlcc-price-from').value = $('#ttlcc-bulk-from').value;
+      renderBulkPreview();
+    };
+    $('#ttlcc-bulk-to').oninput = () => {
+      if (['price_update', 'create'].includes(bulkOperation())) $('#ttlcc-price-to').value = $('#ttlcc-bulk-to').value;
+      renderBulkPreview();
+    };
+    $('#ttlcc-bulk-file').onchange = async e => {
+      const files = [...(e.target.files || [])];
+      if (!files.length) return;
+
+      try {
+        await loadBulkTxtFiles(files);
+      } catch (err) {
+        state.bulk.parsed = [];
+        state.bulk.pricing.clear();
+        toast(`Nạp TXT lỗi: ${err.message}`, 'error', 8000);
+        renderBulkPreview();
+      }
+    };
+
+    $('#ttlcc-bulk-parse').onclick = () => {
+      try {
+        const parsed = parseTxtBatch($('#ttlcc-bulk-text').value);
+        applyParsedTxtBatch(parsed, `Parse OK: ${parsed.length} chương.`);
+      } catch (err) {
+        state.bulk.parsed = [];
+        state.bulk.pricing.clear();
+        toast(`Parse TXT lỗi: ${err.message}`, 'error', 6000);
+        renderBulkPreview();
+      }
+    };
+
+    $('#ttlcc-price-type').onchange = () => {
+      const t = $('#ttlcc-price-type').value;
+      const v = $('#ttlcc-price-value');
+      v.disabled = t !== 'stars';
+      v.value = t === 'stars' ? (Number(v.value) || 5) : t === 'diamond' ? 1 : '';
+    };
+    $('#ttlcc-price-apply').onclick = applyPricingRange;
+    $('#ttlcc-price-alt-star').onclick = () => applyAlternating('stars');
+    $('#ttlcc-price-alt-kc').onclick = () => applyAlternating('diamond');
+    $('#ttlcc-bulk-run').onclick = () => runBulk().catch(err => toast(err.message, 'error'));
+    $('#ttlcc-bulk-cancel').onclick = () => {
+      state.cancelled = true;
+      toast('Đã nhận lệnh hủy; batch sẽ dừng trước request kế tiếp.', 'warn');
+    };
+
+    $('#ttlcc-revenue-refresh').onclick = () =>
+      loadRevenueData({ force: true }).catch(() => {});
+
+    $('#ttlcc-modal-close').onclick = closeModal;
+    $('#ttlcc-modal').addEventListener('click', e => { if (e.target.id === 'ttlcc-modal') closeModal(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+    $('#ttlcc-log-clear').onclick = () => {
+      state.log.length = 0;
+      $('#ttlcc-log').innerHTML = '';
+    };
+  }
+
+  // ==========================================================
+  // START
+  // ==========================================================
+
+  async function start() {
+    injectUi();
+    addLog(`Control Center v${VERSION} khởi động.`);
+    setStatus('Đang tải dữ liệu quản lý…');
 
     try {
       await loadStories();
-      if (state.selectedStoryId) {
-        await loadChapters();
-      }
-      setStatus('Sẵn sàng.', 'success');
+      if (state.selectedStoryId && !state.chapters.length) await loadChapters();
+      syncBulkOperationUi();
+      renderDashboard();
+      setStatus('Sẵn sàng.', 'ok');
     } catch (err) {
-      setStatus(err.message, 'error');
-      addLog(err.message, 'error');
+      setStatus(`Khởi tạo lỗi: ${err.message}`, 'error');
+      toast(`Khởi tạo chưa đầy đủ: ${err.message}`, 'error', 7000);
     }
   }
 
-  init();
+  window.TTL_CONTROL_CENTER = {
+    version: VERSION,
+    state,
+    refreshStories: () => loadStories(),
+    refreshChapters: () => loadChapters(),
+    selectStory,
+    openChapter: openChapterEditor,
+    createChapter: openCreateChapter,
+    editStory: () => loadStoryEditor(),
+    openRevenue: () => {
+      switchTab('revenue');
+      return loadRevenueData({ force: true });
+    },
+    minimize() { $('#ttlcc-panel')?.classList.add('ttlcc-minimized'); savePrefs(); },
+    restore() { $('#ttlcc-panel')?.classList.remove('ttlcc-minimized'); savePrefs(); },
+  };
+
+  start();
 })();
