@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Trích Tinh Lâu - Control Center Toàn Diện
 // @namespace    https://github.com/caccac11/TTL
-// @version      1.2.4
-// @description  Control Center quản lý truyện + chương + bulk update/create/fix giá + doanh thu. Một chức năng chỉ giữ một workflow tối ưu; đọc form/route thật từ server.
+// @version      1.4.3
+// @description  TTL Control: giao diện phẳng một trục cuộn, bulk native an toàn, update pipeline no-follow, quản lý truyện/chương/doanh thu.
 // @match        https://trichtinhlau.com/*
 // @homepageURL  https://github.com/caccac11/TTL
 // @supportURL   https://github.com/caccac11/TTL/issues
@@ -24,7 +24,7 @@
   if (window.__TTL_CONTROL_CENTER__) return;
   window.__TTL_CONTROL_CENTER__ = true;
 
-  const VERSION = '1.2.4';
+  const VERSION = '1.4.3';
   const ORIGIN = location.origin;
   const STORE_KEY = 'ttl-control-center-v1';
 
@@ -41,6 +41,17 @@
     requestGapMs: 800,
     bulkCooldownEvery: 10,
     bulkCooldownMs: 3500,
+    bulkCreateTimeoutMs: 180000,
+    bulkUpdatePrepareConcurrency: 2,
+    bulkUpdateWriteConcurrency: 2,
+    bulkUpdateVerifyConcurrency: 2,
+    bulkUpdateRequestGapMs: 360,
+    bulkUpdatePhaseCooldownMs: 450,
+    bulkUpdateJobAttempts: 3,
+    bulkUpdateVerifyAttempts: 3,
+    bulkUpdateRetryBaseMs: 1200,
+    bulkCreateReconcileAttempts: 5,
+    bulkCreateReconcileBaseMs: 900,
     maxPreviewRows: 250,
     maxLogLines: 600,
     pricing: {
@@ -53,6 +64,7 @@
   const state = {
     stories: new Map(),
     storySearchForm: null,
+    storyLoadSeq: 0,
     selectedStoryId: null,
     selectedStory: null,
     storyEditorModel: null,
@@ -61,6 +73,8 @@
     chapterMap: new Map(),
     chapterHeaderMap: {},
     chapterLoading: false,
+    chapterLoadSeq: 0,
+    chapterLoadingStoryId: null,
     running: false,
     cancelled: false,
     snapshotCache: new Map(),
@@ -71,7 +85,12 @@
       operation: 'price_update',
     },
     log: [],
-    activeTab: 'dashboard',
+    activeTab: 'stories',
+
+    // Monotonic counter used only for adaptive update health telemetry.
+    // Any GET retry/fallback increments this so a job that eventually succeeds
+    // can still be classified as DEGRADED rather than CLEAN.
+    netRetrySeq: 0,
 
     revenue: {
       loaded: false,
@@ -180,7 +199,6 @@
         STORE_KEY,
         JSON.stringify({
           selectedStoryId: state.selectedStoryId,
-          activeTab: state.activeTab,
           minimized: $('#ttlcc-panel')?.classList.contains('ttlcc-minimized') || false,
         })
       );
@@ -191,11 +209,8 @@
     try {
       const prefs = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
 
-      // Migration từ v1.0: tab "tools" đã được rút gọn thành "revenue".
-      if (prefs.activeTab === 'tools') {
-        prefs.activeTab = 'revenue';
-      }
-
+      // Tab đang mở không còn được lưu. Mỗi lần khởi động UI luôn bắt đầu ở Danh sách.
+      delete prefs.activeTab;
       return prefs;
     } catch {
       return {};
@@ -259,6 +274,7 @@
           retryAfterMs(res),
           CFG.retryBaseMs * (2 ** (attempt - 1)) + jitter(450)
         );
+        state.netRetrySeq++;
         addLog(`${label}: HTTP ${res.status}; retry ${attempt + 1}/${CFG.getAttempts} sau ${Math.ceil(wait / 1000)}s`, 'warn');
         try { await res.body?.cancel(); } catch {}
         await sleep(wait);
@@ -266,6 +282,7 @@
         clearTimeout(timer);
         last = err;
         if (attempt === CFG.getAttempts) break;
+        state.netRetrySeq++;
         const wait = CFG.retryBaseMs * (2 ** (attempt - 1)) + jitter(450);
         addLog(`${label}: ${err?.message || err}; retry ${attempt + 1}/${CFG.getAttempts}`, 'warn');
         await sleep(wait);
@@ -332,6 +349,7 @@
         via: 'fetch',
       };
     } catch (err) {
+      state.netRetrySeq++;
       addLog(`${label}: fetch không đọc được (${err.message}); thử navigation fallback...`, 'warn');
       const nav = await hiddenNavigateHtml(url);
       return { ...nav, status: 200, via: 'iframe' };
@@ -346,7 +364,14 @@
     };
   }
 
-  async function postOnce(url, { body, headers = {}, label = 'POST', rawMethod = 'POST' } = {}) {
+  async function postOnce(url, {
+    body,
+    headers = {},
+    label = 'POST',
+    rawMethod = 'POST',
+    redirectMode = 'follow',
+    acceptManualRedirect = false,
+  } = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CFG.getTimeoutMs);
 
@@ -355,7 +380,7 @@
         method: rawMethod,
         credentials: 'same-origin',
         cache: 'no-store',
-        redirect: 'follow',
+        redirect: redirectMode,
         headers: {
           Accept: 'text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5',
           ...headers,
@@ -364,6 +389,23 @@
         signal: controller.signal,
       });
       clearTimeout(timer);
+
+      // Với redirect:'manual', browser có thể trả:
+      // - status 3xx same-origin, hoặc
+      // - type='opaqueredirect', status=0.
+      // Trong cả hai trường hợp request ghi đã tới server, còn redirect GET bị chặn
+      // có chủ đích. Caller vẫn VERIFY trạng thái thật ở pha sau.
+      if (
+        acceptManualRedirect &&
+        redirectMode === 'manual' &&
+        (
+          res.type === 'opaqueredirect' ||
+          (res.status >= 300 && res.status < 400)
+        )
+      ) {
+        return res;
+      }
+
       if (!res.ok) throw new Error(`${label}: HTTP ${res.status}`);
       return res;
     } catch (err) {
@@ -672,7 +714,12 @@
     };
   }
 
-  async function submitRenderedForm(form, model, label) {
+  async function submitRenderedForm(
+    form,
+    model,
+    label,
+    { noFollowRedirect = false } = {}
+  ) {
     const payload = panelFormToPayload(form, model);
 
     if (model.rawMethod === 'GET') {
@@ -688,6 +735,9 @@
       ...payload,
       rawMethod: model.rawMethod || 'POST',
       label,
+      ...(noFollowRedirect
+        ? { redirectMode: 'manual', acceptManualRedirect: true }
+        : {}),
     });
   }
 
@@ -833,7 +883,13 @@
   }
 
   async function loadStories({ serverSearch = false, query = '' } = {}) {
-    setStatus(serverSearch ? 'Đang tìm truyện trên server…' : 'Đang tải danh sách truyện…');
+    // Search cần form thật của server. Nếu chưa có, nạp danh sách một lần trước.
+    if (serverSearch && !state.storySearchForm) {
+      await loadStories();
+    }
+
+    const requestSeq = ++state.storyLoadSeq;
+    setStatus(serverSearch ? 'Đang tìm truyện…' : 'Đang tải truyện…');
 
     let doc;
     let pageUrl = routeUrl('/truyen');
@@ -849,7 +905,6 @@
       });
       if (searchForm) state.storySearchForm = formToModel(searchForm, pageUrl);
     } else {
-      if (!state.storySearchForm) await loadStories();
       const p = modelToParams(state.storySearchForm, {
         key_search: query,
         date_start: '',
@@ -868,11 +923,17 @@
     const found = parseStoriesFromDoc(doc, pageUrl);
     await hydrateStoryTitles(found);
 
+    // Refresh/search cũ không được ghi đè kết quả mới hơn.
+    if (requestSeq !== state.storyLoadSeq) {
+      addLog(`Bỏ kết quả story stale (request ${requestSeq}).`, 'info');
+      return found;
+    }
+
     if (!serverSearch) state.stories.clear();
     mergeStories(found);
 
     renderStoryList();
-    setStatus(`Đã nhận ${state.stories.size} truyện.`, 'ok');
+    setStatus(`${state.stories.size} truyện đã sẵn sàng.`, 'ok');
 
     if (!state.selectedStoryId || !state.stories.has(Number(state.selectedStoryId))) {
       const remembered = Number(loadPrefs().selectedStoryId || 0);
@@ -901,6 +962,8 @@
       return;
     }
 
+    const frag = document.createDocumentFragment();
+
     for (const story of rows) {
       const el = document.createElement('button');
       el.type = 'button';
@@ -910,8 +973,10 @@
         <span class="ttlcc-story-id">#${story.id}</span>
       `;
       el.onclick = () => selectStory(story.id, { loadChaptersNow: true });
-      body.appendChild(el);
+      frag.appendChild(el);
     }
+
+    body.appendChild(frag);
   }
 
   function resetBulkForStoryChange() {
@@ -944,7 +1009,16 @@
 
     const previousStoryId = Number(state.selectedStoryId || 0);
 
+    if (state.running && previousStoryId && previousStoryId !== id) {
+      toast('Batch đang chạy. Hãy dừng hoặc chờ hoàn tất trước khi đổi truyện.', 'warn', 4500);
+      return false;
+    }
+
     if (previousStoryId && previousStoryId !== id) {
+      // Invalidate mọi GET chapter cũ ngay khi context truyện đổi.
+      state.chapterLoadSeq++;
+      state.chapterLoading = false;
+      state.chapterLoadingStoryId = null;
       resetBulkForStoryChange();
 
       // Không để bảng/chỉ số/chapter template của truyện cũ tồn tại
@@ -956,8 +1030,8 @@
       state.storyEditorModel = null;
 
       addLog(
-        `Đổi truyện #${previousStoryId} → #${id}: đã xóa dữ liệu chương/TXT/target Bulk cũ để tránh thao tác nhầm truyện.`,
-        'warn'
+        `Đổi truyện #${previousStoryId} → #${id}. Đã làm sạch dữ liệu batch của truyện cũ.`,
+        'info'
       );
     }
 
@@ -980,6 +1054,8 @@
     if (loadChaptersNow) {
       try { await loadChapters(id); } catch (err) { toast(`Không tải được chương: ${err.message}`, 'error', 5000); }
     }
+
+    return true;
   }
 
   function renderStoryHeader() {
@@ -987,7 +1063,7 @@
     const title = $('#ttlcc-selected-title');
     const sub = $('#ttlcc-selected-sub');
     if (title) title.textContent = story ? story.title : 'Chưa chọn truyện';
-    if (sub) sub.textContent = story ? `ID ${story.id}` : 'Hãy chọn truyện từ danh sách';
+    if (sub) sub.textContent = story ? `#${story.id}` : '';
 
     const badge = $('#ttlcc-story-badge');
     if (badge) badge.textContent = story ? `#${story.id}` : '—';
@@ -1070,7 +1146,8 @@
               await submitRenderedForm(
                 uiForm,
                 liveModel,
-                action
+                action,
+                { noFollowRedirect: true }
               );
 
               toast(
@@ -1095,13 +1172,13 @@
     } catch (err) {
       host.innerHTML = `
         <div class="ttlcc-error-box">
-          Không dựng được form tùy biến: ${esc(err.message)}
+          Không mở được trình chỉnh sửa: ${esc(err.message)}
           <button
             class="ttlcc-btn ttlcc-btn-soft"
             id="ttlcc-story-native-fallback"
             type="button"
           >
-            Mở form gốc trong Control Center
+            Mở form gốc
           </button>
         </div>`;
 
@@ -1118,6 +1195,7 @@
   }
 
   async function togglePublishSelected() {
+    if (state.running) return toast('Batch đang chạy. Không thể đổi trạng thái truyện lúc này.', 'warn');
     if (!state.selectedStoryId) return toast('Chưa chọn truyện.', 'warn');
 
     let story = state.stories.get(Number(state.selectedStoryId));
@@ -1141,6 +1219,8 @@
         body: params.toString(),
         headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
         label: `Publish truyện #${story.id}`,
+        redirectMode: 'manual',
+        acceptManualRedirect: true,
       });
       toast('Đã gửi thay đổi trạng thái. Đang tải lại danh sách…', 'ok');
       await sleep(450);
@@ -1246,17 +1326,35 @@
   }
 
   async function loadChapters(storyId = state.selectedStoryId) {
+    storyId = Number(storyId || 0);
     if (!storyId) throw new Error('Chưa chọn truyện.');
-    if (state.chapterLoading) return;
 
+    const requestSeq = ++state.chapterLoadSeq;
     state.chapterLoading = true;
+    state.chapterLoadingStoryId = storyId;
+
     const listBody = $('#ttlcc-chapter-body');
-    if (listBody) listBody.innerHTML = '<tr><td colspan="10" class="ttlcc-loading">Đang tải danh sách chương…</td></tr>';
+    if (listBody && Number(state.selectedStoryId) === storyId) {
+      listBody.innerHTML = '<tr><td colspan="5" class="ttlcc-loading">Đang tải chương…</td></tr>';
+    }
 
     try {
       const url = routeUrl(`/chapter/${storyId}`);
       const { doc, finalUrl } = await fetchDoc(url, `GET chương truyện #${storyId}`);
       const parsed = parseChapterList(doc, finalUrl, storyId);
+
+      // Chỉ request mới nhất của đúng truyện đang chọn mới được phép commit state.
+      // Đây là guard chống race khi user đổi truyện nhanh trong lúc GET cũ còn bay.
+      if (
+        requestSeq !== state.chapterLoadSeq ||
+        Number(state.selectedStoryId) !== storyId
+      ) {
+        addLog(
+          `Bỏ kết quả chapter stale của truyện #${storyId} (request ${requestSeq}).`,
+          'info'
+        );
+        return false;
+      }
 
       state.chapters = parsed.rows;
       state.chapterMap = new Map(parsed.rows.map(r => [r.chapterNo, r]));
@@ -1267,9 +1365,13 @@
       renderChapters();
       renderDashboard();
       renderBulkPreview();
-      setStatus(`Đã tải ${state.chapters.length} chương của truyện #${storyId}.`, 'ok');
+      setStatus(`${state.chapters.length} chương đã sẵn sàng.`, 'ok');
+      return true;
     } finally {
-      state.chapterLoading = false;
+      if (requestSeq === state.chapterLoadSeq) {
+        state.chapterLoading = false;
+        state.chapterLoadingStoryId = null;
+      }
     }
   }
 
@@ -1290,30 +1392,43 @@
     });
 
     if (!rows.length) {
-      body.innerHTML = '<tr><td colspan="10" class="ttlcc-empty">Không có chương phù hợp.</td></tr>';
+      body.innerHTML = '<tr><td colspan="5" class="ttlcc-empty">Không có chương phù hợp.</td></tr>';
       return;
     }
+
+    const frag = document.createDocumentFragment();
 
     for (const r of rows) {
       const price = r.diamonds > 0 ? `${r.diamonds} KC` : r.stars > 0 ? `${r.stars} sao` : 'FREE';
       const shortPaid = r.wordCount > 0 && r.wordCount < CFG.pricing.minPaidWords && (r.stars > 0 || r.diamonds > 0);
+      const status = r.status && r.status !== '—'
+        ? `<span class="ttlcc-meta-chip">${esc(r.status)}</span>`
+        : '';
       const tr = document.createElement('tr');
       if (shortPaid) tr.classList.add('ttlcc-row-warn');
+
       tr.innerHTML = `
-        <td>${r.chapterNo}</td>
-        <td class="ttlcc-left">${esc(r.title)}</td>
-        <td>${esc(r.status || '—')}</td>
-        <td>${esc(r.slug || '—')}</td>
+        <td class="ttlcc-num">${r.chapterNo}</td>
+        <td class="ttlcc-left">
+          <div class="ttlcc-chapter-title">${esc(r.title)}</div>
+          ${status ? `<div class="ttlcc-chapter-meta">${status}</div>` : ''}
+        </td>
         <td>${r.wordCount.toLocaleString()}</td>
-        <td>${esc(r.passLabel || '—')}</td>
-        <td>${esc(price)}${shortPaid ? '<div class="ttlcc-mini-warn">&lt;1000 từ nhưng đang trả phí</div>' : ''}</td>
-        <td class="ttlcc-row-actions">
-          <button type="button" class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" data-edit="${r.chapterNo}">Sửa</button>
-          <button type="button" class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-danger" data-delete="${r.chapterNo}" ${r.deleteModel ? '' : 'disabled'}>Xóa</button>
+        <td>
+          <span class="ttlcc-price-chip ${r.diamonds > 0 ? 'diamond' : r.stars > 0 ? 'stars' : 'free'}">${esc(price)}</span>
+          ${shortPaid ? '<span class="ttlcc-alert-dot" title="Dưới 1000 từ nhưng đang trả phí">!</span>' : ''}
+        </td>
+        <td>
+          <div class="ttlcc-row-actions">
+            <button type="button" class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" data-edit="${r.chapterNo}">Sửa</button>
+            <button type="button" class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-ghost-danger" data-delete="${r.chapterNo}" ${r.deleteModel ? '' : 'disabled'}>Xóa</button>
+          </div>
         </td>
       `;
-      body.appendChild(tr);
+      frag.appendChild(tr);
     }
+
+    body.appendChild(frag);
 
     body.querySelectorAll('[data-edit]').forEach(btn => {
       btn.onclick = () => openChapterEditor(Number(btn.dataset.edit));
@@ -1333,6 +1448,7 @@
   }
 
   async function openChapterEditor(chapterNo) {
+    if (state.running) return toast('Batch đang chạy. Không thể sửa chương lúc này.', 'warn');
     const row = state.chapterMap.get(Number(chapterNo));
     if (!row) return toast(`Không map được chương ${chapterNo}.`, 'error');
 
@@ -1357,7 +1473,12 @@
 
           btn.disabled = true;
           try {
-            await submitRenderedForm(uiForm, liveModel, `PUT CHƯƠNG ${chapterNo}`);
+            await submitRenderedForm(
+              uiForm,
+              liveModel,
+              `PUT CHƯƠNG ${chapterNo}`,
+              { noFollowRedirect: true }
+            );
             toast(`Đã lưu CHƯƠNG ${chapterNo}. Đang re-check…`, 'ok');
             await sleep(450);
             await loadChapters();
@@ -1377,6 +1498,7 @@
   }
 
   async function openCreateChapter() {
+    if (state.running) return toast('Batch đang chạy. Không thể tạo chương lúc này.', 'warn');
     if (!state.selectedStoryId) return toast('Chưa chọn truyện.', 'warn');
 
     openModal('Thêm chương mới', '<div class="ttlcc-loading">Đang đọc form tạo chương…</div>');
@@ -1412,7 +1534,12 @@
 
           btn.disabled = true;
           try {
-            await submitRenderedForm(uiForm, liveModel, 'POST tạo chương');
+            await submitRenderedForm(
+              uiForm,
+              liveModel,
+              'POST tạo chương',
+              { noFollowRedirect: true }
+            );
             toast('Server đã nhận chương mới. Đang xác minh danh sách…', 'ok');
             await sleep(600);
             await loadChapters();
@@ -1445,6 +1572,7 @@
   }
 
   async function deleteChapter(chapterNo) {
+    if (state.running) return toast('Batch đang chạy. Không thể xóa chương lúc này.', 'warn');
     const row = state.chapterMap.get(Number(chapterNo));
     if (!row?.deleteModel) return toast('Không tìm thấy form DELETE thật của chương.', 'error');
 
@@ -1461,6 +1589,8 @@
         body: p.toString(),
         headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
         label: `DELETE CHƯƠNG ${chapterNo}`,
+        redirectMode: 'manual',
+        acceptManualRedirect: true,
       });
       toast(`Đã gửi xóa CHƯƠNG ${chapterNo}. Đang re-check…`, 'ok');
       await sleep(500);
@@ -1577,6 +1707,7 @@
 
     const batches = [];
 
+    // Parse từng file RIÊNG bằng parser TTL gốc.
     for (const file of files) {
       const raw = String(await file.text())
         .replace(/^\uFEFF/, '')
@@ -1601,19 +1732,20 @@
       });
     }
 
-    // Sắp xếp theo chương đầu, không phụ thuộc thứ tự click chọn file.
+    // Sắp theo chương đầu để kết quả không phụ thuộc thứ tự user chọn file.
     batches.sort((a, b) =>
       (a.first - b.first) ||
       String(a.file.name || '').localeCompare(String(b.file.name || ''), 'vi')
     );
 
-    // Chặn trùng chapter_number giữa nhiều file.
+    // Fail-closed khi 2 file chứa cùng chapter_number.
     const owner = new Map();
     const duplicates = [];
 
     for (const batch of batches) {
       for (const item of batch.parsed) {
         const no = Number(item.chapterNo);
+
         if (owner.has(no)) {
           duplicates.push({
             no,
@@ -1642,8 +1774,8 @@
       .flatMap(batch => batch.parsed)
       .sort((a, b) => a.chapterNo - b.chapterNo);
 
-    // Textarea chỉ để user kiểm tra/chỉnh tay. State parsed được tạo trực tiếp
-    // từ từng file nên ranh giới file không thể làm parser nuốt nhầm chương.
+    // Textarea chỉ để user xem/chỉnh tay.
+    // State parsed đã lấy trực tiếp từ từng file nên không bị lỗi ranh giới file.
     $('#ttlcc-bulk-text').value = batches
       .map(batch => batch.raw.trim())
       .filter(Boolean)
@@ -1837,6 +1969,8 @@
     const maxExisting = state.chapters.length ? Math.max(...state.chapters.map(x => x.chapterNo)) : 0;
     let changed = 0;
 
+    const frag = document.createDocumentFragment();
+
     for (const item of items.slice(0, CFG.maxPreviewRows)) {
       const row = state.chapterMap.get(item.chapterNo);
       const p = getPricing(item.chapterNo);
@@ -1875,8 +2009,10 @@
         </td>
         <td><span class="ttlcc-state ${/SẼ/.test(status) ? 'pending' : /KHÔNG ĐỔI/.test(status) ? 'ok' : /THIẾU|ĐÃ TỒN TẠI/.test(status) ? 'bad' : ''}">${esc(status)}</span></td>
       `;
-      body.appendChild(tr);
+      frag.appendChild(tr);
     }
+
+    body.appendChild(frag);
 
     body.querySelectorAll('[data-price-type]').forEach(sel => {
       sel.onchange = () => {
@@ -1930,11 +2066,20 @@
 
   async function submitChapterOverrides(snapshot, overrides, label) {
     const params = modelToParams(snapshot.model, overrides);
+
+    // Chapter update endpoint thường redirect sau khi commit. Nếu fetch follow redirect,
+    // mỗi PUT/POST update vô tình sinh thêm một GET tải trang đích. Khi GET đó rớt,
+    // browser báo "Failed to fetch" dù server đã ghi thành công.
+    //
+    // Ta chặn follow redirect tại đây. Trạng thái chapter được VERIFY độc lập bằng
+    // fetchChapterSnapshot()/verifyChapter(), nên không cần tải trang redirect.
     return postOnce(snapshot.model.action, {
       rawMethod: snapshot.model.rawMethod || 'POST',
       body: params.toString(),
       headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
       label,
+      redirectMode: 'manual',
+      acceptManualRedirect: true,
     });
   }
 
@@ -1966,6 +2111,982 @@
     return state.chapterCreateModel;
   }
 
+  function htmlToPlainText(html) {
+    const doc = new DOMParser().parseFromString(`<body>${html || ''}</body>`, 'text/html');
+    return text(doc.body.textContent || '');
+  }
+
+  function makeBulkExcerpt(html, maxLen = 100) {
+    const plain = htmlToPlainText(html);
+    if (plain.length <= maxLen) return plain;
+    return `${plain.slice(0, maxLen).trimEnd()}...`;
+  }
+
+  async function getNativeBulkContext() {
+    const storyId = Number(state.selectedStoryId);
+    if (!storyId) throw new Error('Chưa chọn truyện.');
+
+    const url = routeUrl(`/chapter/upload-word/${storyId}`);
+    const { doc, html, finalUrl } = await fetchDoc(url, `GET preflight native bulk #${storyId}`);
+    if (!finalUrl.startsWith(ORIGIN)) throw new Error('Preflight bulk bị redirect ngoài domain.');
+
+    const expectedPath = `/chapter/bulk-store/${storyId}`;
+    const hasEndpoint = String(html).includes(expectedPath);
+    const hasParsedArray = /chapters\s*:\s*parsedChapters\b/.test(String(html));
+    const storyMatch = String(html).match(/\bconst\s+truyenId\s*=\s*(\d+)\s*;/);
+    const countMatch = String(html).match(/\bconst\s+currentChapterCount\s*=\s*(\d+)\s*;/);
+    const token = doc.querySelector('meta[name="csrf-token"]')?.getAttribute('content')
+      || doc.querySelector('input[name="_token"]')?.value
+      || '';
+
+    if (!hasEndpoint) throw new Error(`Web không còn expose ${expectedPath}; dừng để tránh POST sai route.`);
+    if (!hasParsedArray) throw new Error('Cơ chế bulk web đã đổi: không còn chapters: parsedChapters.');
+    if (storyMatch && Number(storyMatch[1]) !== storyId) {
+      throw new Error(`Preflight bulk trả sai truyện: web=${storyMatch[1]}, cần=${storyId}.`);
+    }
+    if (!token) throw new Error('Không lấy được CSRF token từ trang native bulk.');
+
+    const currentChapterCount = countMatch ? Number(countMatch[1]) : null;
+    return {
+      storyId,
+      endpoint: routeUrl(expectedPath),
+      token,
+      currentChapterCount,
+    };
+  }
+
+  function buildNativeBulkParams(items, token) {
+    const params = new URLSearchParams();
+    params.append('_token', token);
+
+    items.forEach((item, index) => {
+      const base = `chapters[${index}]`;
+      params.append(`${base}[title]`, sanitizeChapterTitle(item.title, item.chapterNo));
+      params.append(`${base}[content]`, item.htmlContent);
+      params.append(`${base}[excerpt]`, makeBulkExcerpt(item.htmlContent));
+      params.append(`${base}[publish_at]`, '');
+      params.append(`${base}[has_warning]`, 'false');
+    });
+
+    return params;
+  }
+
+  async function postNativeBulkCreate(context, items) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CFG.bulkCreateTimeoutMs);
+    const startedAt = performance.now();
+
+    try {
+      const body = buildNativeBulkParams(items, context.token).toString();
+      const res = await fetch(context.endpoint, {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        redirect: 'follow',
+        headers: {
+          Accept: 'application/json,text/plain;q=0.9,*/*;q=0.5',
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body,
+        signal: controller.signal,
+      });
+
+      const durationMs = Math.round(performance.now() - startedAt);
+      const raw = await res.text();
+      let json = null;
+      try { json = raw ? JSON.parse(raw) : null; } catch {}
+
+      if (!res.ok) {
+        const msg = json?.message || text(raw).slice(0, 240) || `HTTP ${res.status}`;
+        throw new Error(`NATIVE BULK HTTP ${res.status}: ${msg}`);
+      }
+      if (json && json.success === false) {
+        throw new Error(`NATIVE BULK từ chối: ${json.message || 'success=false'}`);
+      }
+
+      return {
+        status: res.status,
+        durationMs,
+        json,
+        finalUrl: res.url || context.endpoint,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function inspectBulkCreateResult(baseline, items) {
+    const expectedNos = items.map(x => x.chapterNo);
+    const expectedSet = new Set(expectedNos);
+    const baselineIds = baseline.ids;
+    const newRows = state.chapters.filter(r => !baselineIds.has(r.chapterId));
+    const countDelta = state.chapters.length - baseline.count;
+    const mappingErrors = [];
+
+    if (countDelta !== items.length) {
+      mappingErrors.push(`delta count=${countDelta}, cần=${items.length}`);
+    }
+    if (newRows.length !== items.length) {
+      mappingErrors.push(`ID mới=${newRows.length}, cần=${items.length}`);
+    }
+
+    for (const item of items) {
+      const row = state.chapterMap.get(item.chapterNo);
+      if (!row) {
+        mappingErrors.push(`thiếu CHƯƠNG ${item.chapterNo}`);
+        continue;
+      }
+      if (baselineIds.has(row.chapterId)) {
+        mappingErrors.push(`CHƯƠNG ${item.chapterNo} vẫn trỏ ID cũ ${row.chapterId}`);
+        continue;
+      }
+
+      let actualTitle = '';
+      let expectedTitle = '';
+      try { actualTitle = sanitizeChapterTitle(row.title, null); } catch { actualTitle = text(row.title); }
+      try { expectedTitle = sanitizeChapterTitle(item.title, item.chapterNo); } catch { expectedTitle = text(item.title); }
+      if (actualTitle !== expectedTitle) {
+        mappingErrors.push(`CHƯƠNG ${item.chapterNo} sai tên: web="${row.title}" cần="${expectedTitle}"`);
+      }
+    }
+
+    for (const row of newRows) {
+      if (!expectedSet.has(row.chapterNo)) {
+        mappingErrors.push(`xuất hiện ID mới ngoài dải: STT ${row.chapterNo}, ID ${row.chapterId}`);
+      }
+    }
+
+    return {
+      ok: mappingErrors.length === 0,
+      countDelta,
+      newRows,
+      mappingErrors,
+    };
+  }
+
+  async function reconcileNativeBulkCreate(baseline, items) {
+    let last = null;
+    let lastLoadError = null;
+
+    for (let attempt = 1; attempt <= CFG.bulkCreateReconcileAttempts; attempt++) {
+      if (attempt > 1) {
+        await sleep(CFG.bulkCreateReconcileBaseMs * attempt + jitter(280));
+      } else {
+        await sleep(650);
+      }
+
+      try {
+        await loadChapters();
+        lastLoadError = null;
+      } catch (err) {
+        lastLoadError = err;
+        addLog(`Reconcile bulk lần ${attempt}: GET danh sách lỗi: ${err.message}`, 'warn');
+        continue;
+      }
+
+      last = inspectBulkCreateResult(baseline, items);
+      if (last.ok) return last;
+
+      // Có nhiều record mới hơn dự kiến là dấu hiệu mutation ngoài batch hoặc duplicate.
+      // Không chờ thêm vì tiếp tục có thể che mất sự cố.
+      if (last.countDelta > items.length || last.newRows.length > items.length) break;
+
+      // Đã đủ số lượng mà mapping vẫn sai thì đây không còn là độ trễ eventual-consistency.
+      if (last.countDelta === items.length && last.newRows.length === items.length) break;
+
+      addLog(
+        `Reconcile bulk lần ${attempt}: chưa ổn (${last.mappingErrors.join('; ')}), sẽ kiểm tra lại.`,
+        'warn'
+      );
+    }
+
+    if (!last && lastLoadError) throw lastLoadError;
+    return last || {
+      ok: false,
+      countDelta: 0,
+      newRows: [],
+      mappingErrors: ['không đọc được trạng thái server sau native bulk'],
+    };
+  }
+
+  async function applyCreatePricingWithExistingEngine(items, verify, stopError, delayMs, labels) {
+    let ok = 0;
+    let errors = 0;
+
+    for (let i = 0; i < items.length; i++) {
+      if (state.cancelled) {
+        addLog('Đã hủy sau khi tạo batch; dừng trước request giá kế tiếp. Các chương đã tạo vẫn còn trên server.', 'warn');
+        break;
+      }
+
+      const item = items[i];
+      const row = state.chapterMap.get(item.chapterNo);
+      if (!row) {
+        errors++;
+        const err = new Error(`Không map được CHƯƠNG ${item.chapterNo} sau native bulk.`);
+        addLog(`${labels.create} LỖI CHƯƠNG ${item.chapterNo}: ${err.message}`, 'error');
+        if (stopError) throw err;
+        continue;
+      }
+
+      const targetP = getPricing(item.chapterNo);
+      try {
+        if (!priceMatchesRow(targetP, row)) {
+          setStatus(`ÁP GIÁ ${i + 1}/${items.length}: CHƯƠNG ${item.chapterNo}`);
+          const snap = await fetchChapterSnapshot(row, true);
+          const pf = pricingFields(targetP, item.chapterNo);
+          const expected = {
+            stars: Number(pf.stars_active || 0),
+            diamonds: Number(pf.diamonds_active || 0),
+          };
+
+          await submitChapterOverrides(snap, {
+            stars_active: pf.stars_active,
+            diamonds_active: pf.diamonds_active,
+          }, `GIÁ CHƯƠNG ${item.chapterNo}`);
+
+          if (verify) {
+            await sleep(350 + jitter(180));
+            await verifyChapter(row, expected);
+          }
+        }
+
+        ok++;
+        addLog(`${labels.create} OK: CHƯƠNG ${item.chapterNo} · ${pricingLabel(targetP)}`, 'ok');
+      } catch (err) {
+        errors++;
+        addLog(`ÁP GIÁ LỖI CHƯƠNG ${item.chapterNo}: ${err.message}`, 'error');
+        if (stopError) throw err;
+      }
+
+      if (i + 1 < items.length) {
+        if ((i + 1) % CFG.bulkCooldownEvery === 0) {
+          await sleep(CFG.bulkCooldownMs);
+        } else if (delayMs) {
+          await sleep(delayMs + jitter(220));
+        }
+      }
+    }
+
+    return { ok, errors };
+  }
+
+  async function runNativeBulkCreate(items, verify, stopError, delayMs, labels) {
+    const sorted = [...items].sort((a, b) => a.chapterNo - b.chapterNo);
+    const baseline = {
+      count: state.chapters.length,
+      maxNo: state.chapters.length ? Math.max(...state.chapters.map(x => x.chapterNo)) : 0,
+      ids: new Set(state.chapters.map(x => x.chapterId)),
+    };
+
+    setStatus(`PREFLIGHT NATIVE BULK: ${sorted.length} chương...`);
+    const context = await getNativeBulkContext();
+
+    if (context.currentChapterCount !== null && context.currentChapterCount !== baseline.count) {
+      throw new Error(
+        `Preflight count lệch: trang bulk=${context.currentChapterCount}, danh sách=${baseline.count}. ` +
+        'Có thể server vừa đổi; hãy quét lại trước khi đăng.'
+      );
+    }
+
+    // Re-check dải ngay trước POST để giảm cửa sổ race giữa validation và write.
+    if (sorted[0].chapterNo !== baseline.maxNo + 1) {
+      throw new Error(`Dải tạo không còn bắt đầu tại ${baseline.maxNo + 1}.`);
+    }
+    for (let i = 0; i < sorted.length; i++) {
+      if (sorted[i].chapterNo !== baseline.maxNo + 1 + i) {
+        throw new Error(`Dải native bulk không liên tục tại CHƯƠNG ${sorted[i].chapterNo}.`);
+      }
+    }
+
+    setStatus(`NATIVE BULK: đang gửi 1 request tạo ${sorted.length} chương...`);
+    addLog(
+      `Native bulk bắt đầu: truyện #${context.storyId}, ${sorted[0].chapterNo}-${sorted.at(-1).chapterNo}, ` +
+      `${sorted.length} chương. Pricing chưa gửi trong request create.`,
+      'info'
+    );
+
+    let writeResult = null;
+    let writeError = null;
+    try {
+      writeResult = await postNativeBulkCreate(context, sorted);
+      addLog(
+        `Native bulk HTTP OK: ${writeResult.status}, ${writeResult.durationMs} ms` +
+        (writeResult.json?.message ? `, ${writeResult.json.message}` : ''),
+        'ok'
+      );
+    } catch (err) {
+      writeError = err;
+      addLog(`Native bulk response bất định/lỗi: ${err.message}. Không retry; đang reconcile server.`, 'warn');
+    }
+
+    setStatus('NATIVE BULK: đang đối chiếu số lượng, ID, STT và tên chương...');
+    const recon = await reconcileNativeBulkCreate(baseline, sorted);
+
+    if (!recon.ok) {
+      const detail = recon.mappingErrors.join('; ');
+      if (recon.countDelta === 0 && recon.newRows.length === 0) {
+        throw new Error(
+          `Native bulk không tạo được chương sau ${CFG.bulkCreateReconcileAttempts} lần kiểm tra. ` +
+          `${writeError ? `Lỗi request: ${writeError.message}. ` : ''}` +
+          'Không tự retry để tránh duplicate nếu server còn xử lý chậm.'
+        );
+      }
+      throw new Error(
+        `Native bulk ở trạng thái KHÔNG AN TOÀN: ${detail}. ` +
+        'Đã dừng trước bước áp giá; tuyệt đối không tự chạy lại create cho đến khi kiểm tra danh sách.'
+      );
+    }
+
+    if (writeError) {
+      addLog('Request bulk từng báo lỗi/bất định nhưng server đã có đủ batch đúng mapping; tiếp tục hậu kiểm giá.', 'warn');
+    }
+
+    addLog(
+      `Reconcile native bulk PASS: +${recon.countDelta} chương, ${recon.newRows.length} ID mới, mapping đúng ${sorted.length}/${sorted.length}.`,
+      'ok'
+    );
+
+    if (state.cancelled) {
+      throw new Error('Batch đã được tạo đầy đủ nhưng người dùng đã yêu cầu hủy; chưa chạy bước áp giá.');
+    }
+
+    return applyCreatePricingWithExistingEngine(sorted, verify, stopError, delayMs, labels);
+  }
+
+
+  function isParallelChapterUpdateOperation(op) {
+    return ['both', 'title', 'content'].includes(op);
+  }
+
+  function isTransientUpdateError(err) {
+    const msg = String(err?.message || err || '');
+    return (
+      /failed to fetch|networkerror|load failed|aborterror|timeout|navigation fallback/i.test(msg) ||
+      /HTTP\s+(408|425|429|500|502|503|504)\b/i.test(msg)
+    );
+  }
+
+  function buildExistingChapterUpdate(item, op) {
+    const overrides = {};
+    const expected = {};
+
+    if (op === 'both' || op === 'title') {
+      overrides.name_chapter = sanitizeChapterTitle(item.title, item.chapterNo);
+      expected.name = overrides.name_chapter;
+    }
+    if (op === 'both' || op === 'content') {
+      overrides.content_chapter = item.htmlContent;
+      overrides.word_count2 = String(countWordsFromHtml(item.htmlContent));
+      expected.content = item.htmlContent;
+    }
+
+    if (!Object.keys(overrides).length) {
+      throw new Error(`Operation "${op}" không có field update hợp lệ.`);
+    }
+    return { overrides, expected };
+  }
+
+  async function verifyChapterWithRetry(row, expected, label, attempts = CFG.bulkUpdateVerifyAttempts) {
+    let last = null;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        // Đợi ngắn trước mỗi GET verify để server hoàn tất commit/flush.
+        await sleep((attempt === 1 ? 500 : 850) + jitter(220));
+        await verifyChapter(row, expected);
+        return { attempts: attempt };
+      } catch (err) {
+        last = err;
+        if (attempt >= attempts) break;
+
+        const wait = CFG.bulkUpdateRetryBaseMs * attempt + jitter(450);
+        addLog(
+          `${label}: verify chưa PASS (${err.message}); thử lại ${attempt + 1}/${attempts} sau ${Math.ceil(wait / 1000)}s.`,
+          'warn'
+        );
+        await sleep(wait);
+      }
+    }
+
+    throw last || new Error(`${label}: verify thất bại.`);
+  }
+
+  async function updateExistingChapterOne(item, op, verify, workerLabel = '') {
+    const row = state.chapterMap.get(item.chapterNo);
+    if (!row) throw new Error(`Không map được CHƯƠNG ${item.chapterNo} trên web.`);
+
+    const { overrides, expected } = buildExistingChapterUpdate(item, op);
+    const maxAttempts = Math.max(1, Number(CFG.bulkUpdateJobAttempts || 3));
+    const netSeqAtStart = Number(state.netRetrySeq || 0);
+    const healthReasons = new Set();
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const prefix = `${workerLabel ? `${workerLabel} · ` : ''}CHƯƠNG ${item.chapterNo}`;
+
+      if (attempt > 1) healthReasons.add(`job-retry-${attempt}`);
+
+      try {
+        // Lấy form edit mới ở mỗi attempt. Không tái sử dụng hidden fields/token
+        // của attempt lỗi trước.
+        const snap = await fetchChapterSnapshot(row, true);
+
+        try {
+          await submitChapterOverrides(
+            snap,
+            overrides,
+            `UPDATE CHƯƠNG ${item.chapterNo} · attempt ${attempt}/${maxAttempts}`
+          );
+        } catch (writeErr) {
+          lastError = writeErr;
+          healthReasons.add('put-response-error');
+
+          // Failed to fetch trên PUT là trạng thái mơ hồ: server có thể đã commit nhưng
+          // response bị rớt. Không retry ngay. Đọc lại chapter trước.
+          addLog(
+            `${prefix}: PUT báo "${writeErr.message}". Đang hậu kiểm server trước khi retry.`,
+            'warn'
+          );
+
+          try {
+            const verifyRecovery = await verifyChapterWithRetry(
+              row,
+              expected,
+              `${prefix} hậu kiểm PUT bất định`,
+              Math.min(2, CFG.bulkUpdateVerifyAttempts)
+            );
+            if (verifyRecovery.attempts > 1) healthReasons.add('recovery-verify-retry');
+            healthReasons.add('recovered-put-response');
+
+            if (Number(state.netRetrySeq || 0) > netSeqAtStart) {
+              healthReasons.add('network-get-retry');
+            }
+
+            addLog(`${prefix}: PUT response bị rớt nhưng server đã commit đúng.`, 'ok');
+            return {
+              row,
+              expected,
+              recoveredAfterWriteError: true,
+              attempts: attempt,
+              degraded: true,
+              healthReasons: [...healthReasons],
+            };
+          } catch (verifyAfterWriteErr) {
+            lastError = new Error(
+              `${writeErr.message}; hậu kiểm chưa xác nhận commit: ${verifyAfterWriteErr.message}`
+            );
+          }
+
+          if (attempt < maxAttempts) {
+            const wait = CFG.bulkUpdateRetryBaseMs * (2 ** (attempt - 1)) + jitter(550);
+            addLog(
+              `${prefix}: retry idempotent ${attempt + 1}/${maxAttempts} sau ${Math.ceil(wait / 1000)}s.`,
+              'warn'
+            );
+            await sleep(wait);
+            continue;
+          }
+
+          throw lastError;
+        }
+
+        if (verify) {
+          try {
+            const verifyResult = await verifyChapterWithRetry(row, expected, `${prefix} verify`);
+            if (verifyResult.attempts > 1) healthReasons.add('verify-retry');
+          } catch (verifyErr) {
+            lastError = verifyErr;
+            healthReasons.add('verify-failed-before-job-retry');
+
+            // PUT đã trả HTTP OK nhưng verify chưa đúng. Có thể là commit chậm hoặc
+            // response/form stale. Chỉ retry cùng payload vì update theo chapter ID
+            // là idempotent.
+            if (attempt < maxAttempts) {
+              const wait = CFG.bulkUpdateRetryBaseMs * (2 ** (attempt - 1)) + jitter(550);
+              addLog(
+                `${prefix}: PUT HTTP OK nhưng verify chưa PASS (${verifyErr.message}); ` +
+                `retry cùng payload ${attempt + 1}/${maxAttempts} sau ${Math.ceil(wait / 1000)}s.`,
+                'warn'
+              );
+              await sleep(wait);
+              continue;
+            }
+            throw verifyErr;
+          }
+        }
+
+        if (Number(state.netRetrySeq || 0) > netSeqAtStart) {
+          healthReasons.add('network-get-retry');
+        }
+
+        return {
+          row,
+          expected,
+          attempts: attempt,
+          degraded: healthReasons.size > 0,
+          healthReasons: [...healthReasons],
+        };
+      } catch (err) {
+        lastError = err;
+
+        // Lỗi GET form/snapshot ở đầu attempt: retry có backoff nếu còn lượt.
+        if (attempt < maxAttempts && isTransientUpdateError(err)) {
+          healthReasons.add('transient-job-error');
+          const wait = CFG.bulkUpdateRetryBaseMs * (2 ** (attempt - 1)) + jitter(550);
+          addLog(
+            `${prefix}: lỗi network "${err.message}", retry ${attempt + 1}/${maxAttempts} sau ${Math.ceil(wait / 1000)}s.`,
+            'warn'
+          );
+          await sleep(wait);
+          continue;
+        }
+
+        throw err;
+      }
+    }
+
+    throw lastError || new Error(`CHƯƠNG ${item.chapterNo}: update thất bại.`);
+  }
+
+  async function runSmoothUpdatePhase({
+    name,
+    entries,
+    concurrency,
+    startGapMs,
+    task,
+    respectCancel = true,
+    stopOnTaskError = false,
+  }) {
+    const list = [...entries];
+    const limit = Math.max(1, Math.min(Number(concurrency || 1), list.length || 1));
+    const gap = Math.max(120, Number(startGapMs || 300));
+    let cursor = 0;
+    let nextStartAt = 0;
+    let stopped = false;
+    let firstError = null;
+
+    async function reserveStart() {
+      const now = Date.now();
+      const planned = Math.max(now, nextStartAt);
+      nextStartAt = planned + gap;
+      if (planned > now) await sleep(planned - now);
+    }
+
+    async function worker(workerId) {
+      while (true) {
+        if (stopped) return;
+        if (respectCancel && state.cancelled) return;
+
+        const idx = cursor++;
+        if (idx >= list.length) return;
+
+        await reserveStart();
+
+        if (stopped) return;
+        if (respectCancel && state.cancelled) return;
+
+        const entry = list[idx];
+
+        try {
+          await task(entry, workerId, idx);
+        } catch (err) {
+          entry.phaseError = err;
+          firstError ||= err;
+          if (stopOnTaskError) stopped = true;
+        }
+      }
+    }
+
+    addLog(
+      `${name}: ${list.length} mục · ${limit} luồng · start-gap=${gap}ms.`,
+      'info'
+    );
+
+    await Promise.all(
+      Array.from({ length: Math.min(limit, list.length) }, (_, i) => worker(i + 1))
+    );
+
+    return {
+      firstError,
+      stopped,
+      processed: list.filter(x => x.phaseTouched).length,
+    };
+  }
+
+  async function runParallelChapterUpdates(items, op, verify, stopError, delayMs, labels) {
+    /*
+     * v1.3.4: tách read/write/read thành ba pha riêng.
+     *
+     * Lý do:
+     * v1.3.3 cho thấy host không thích GET form/PUT/GET verify của nhiều chapter
+     * chồng chéo nhau. Hai full-pipeline worker vẫn tạo burst hỗn hợp và rớt response.
+     *
+     * Pipeline mới:
+     * 1) PREPARE: GET form edit cho toàn batch.
+     * 2) WRITE: chỉ PUT, không GET hậu kiểm chen vào.
+     * 3) VERIFY: sau khi write lắng xuống mới GET kiểm chứng.
+     * 4) RECOVERY: chỉ những chapter thật sự chưa PASS mới retry tuần tự.
+     *
+     * PUT "Failed to fetch" KHÔNG được retry ngay vì server có thể đã commit.
+     * Nó được đánh dấu AMBIGUOUS và giải quyết ở VERIFY.
+     */
+    const requestGap = Math.max(180, Number(CFG.bulkUpdateRequestGapMs || 300));
+    const phaseCooldown = Math.max(400, Number(CFG.bulkUpdatePhaseCooldownMs || 650));
+    const prepareConcurrency = clamp(Number(CFG.bulkUpdatePrepareConcurrency || 2), 1, 2);
+    const writeConcurrency = clamp(Number(CFG.bulkUpdateWriteConcurrency || 2), 1, 2);
+    const verifyConcurrency = clamp(Number(CFG.bulkUpdateVerifyConcurrency || 2), 1, 2);
+
+    // Delay UI vẫn có tác dụng, nhưng không để default 1000ms làm pipeline giật cục.
+    // Nó chỉ có thể nâng pacing request lên tối đa 600ms.
+    const effectiveGap = Math.max(
+      requestGap,
+      Math.min(Math.max(0, Number(delayMs || 0)), 450)
+    );
+
+    const entries = items.map(item => {
+      const row = state.chapterMap.get(item.chapterNo);
+      if (!row) throw new Error(`Không map được CHƯƠNG ${item.chapterNo} trên web.`);
+      const { overrides, expected } = buildExistingChapterUpdate(item, op);
+      return {
+        item,
+        row,
+        overrides,
+        expected,
+        snapshot: null,
+        prepared: false,
+        writeAttempted: false,
+        writeResponseOk: false,
+        writeError: null,
+        verified: false,
+        recovered: false,
+        finalError: null,
+        degraded: false,
+        healthReasons: new Set(),
+      };
+    });
+
+    addLog(
+      `${labels[op]}: pipeline mượt PREPARE→WRITE→VERIFY · ` +
+      `GET=${prepareConcurrency}, PUT=${writeConcurrency}, VERIFY=${verifyConcurrency} luồng · ` +
+      `no-follow-redirect=ON · gap=${effectiveGap}ms · ${items.length} chương · ` +
+      `verify=${verify ? 'ON' : 'OFF'}.`,
+      'info'
+    );
+
+    // -------------------- PHASE 1: PREPARE --------------------
+    setStatus(`${labels[op]} · PREPARE form 0/${entries.length}`);
+
+    let preparedCount = 0;
+    let prepareFailed = 0;
+
+    await runSmoothUpdatePhase({
+      name: `${labels[op]} PREPARE`,
+      entries,
+      concurrency: prepareConcurrency,
+      startGapMs: effectiveGap,
+      stopOnTaskError: false,
+      respectCancel: true,
+      task: async (entry, workerId) => {
+        entry.phaseTouched = true;
+        const seqBefore = Number(state.netRetrySeq || 0);
+
+        try {
+          entry.snapshot = await fetchChapterSnapshot(entry.row, true);
+          entry.prepared = true;
+          preparedCount++;
+
+          if (Number(state.netRetrySeq || 0) > seqBefore) {
+            entry.degraded = true;
+            entry.healthReasons.add('prepare-get-retry');
+          }
+
+          addLog(
+            `${labels[op]} PREPARE OK: CHƯƠNG ${entry.item.chapterNo}` +
+            `${entry.degraded ? ' · DEGRADED' : ''}`,
+            entry.degraded ? 'warn' : 'ok'
+          );
+        } catch (err) {
+          entry.finalError = err;
+          prepareFailed++;
+          addLog(
+            `${labels[op]} PREPARE LỖI CHƯƠNG ${entry.item.chapterNo}: ${err.message}`,
+            'error'
+          );
+        }
+      },
+    });
+
+    // Clear marker so later phases can count independently.
+    entries.forEach(e => { delete e.phaseTouched; });
+
+    if (state.cancelled) {
+      throw new Error(
+        `${labels[op]} đã hủy trong PREPARE. Chưa có PUT nào được gửi.`
+      );
+    }
+
+    if (prepareFailed && stopError) {
+      throw new Error(
+        `${labels[op]} dừng ở PREPARE: ${prepareFailed}/${entries.length} chương không lấy được form. ` +
+        `Chưa có nội dung nào bị ghi.`
+      );
+    }
+
+    const writable = entries.filter(e => e.prepared && !e.finalError);
+
+    if (!writable.length) {
+      throw new Error(`${labels[op]}: không có chapter nào đủ điều kiện WRITE.`);
+    }
+
+    addLog(
+      `${labels[op]} PREPARE hoàn tất: ${writable.length}/${entries.length} form sẵn sàng.`,
+      prepareFailed ? 'warn' : 'ok'
+    );
+
+    await sleep(phaseCooldown + jitter(180));
+
+    // -------------------- PHASE 2: WRITE --------------------
+    setStatus(`${labels[op]} · WRITE 0/${writable.length}`);
+
+    let writeDone = 0;
+    let ambiguousWrites = 0;
+
+    await runSmoothUpdatePhase({
+      name: `${labels[op]} WRITE`,
+      entries: writable,
+      concurrency: writeConcurrency,
+      startGapMs: effectiveGap,
+      stopOnTaskError: false,
+      respectCancel: true,
+      task: async (entry) => {
+        entry.phaseTouched = true;
+        entry.writeAttempted = true;
+        const seqBefore = Number(state.netRetrySeq || 0);
+
+        try {
+          await submitChapterOverrides(
+            entry.snapshot,
+            entry.overrides,
+            `UPDATE CHƯƠNG ${entry.item.chapterNo} · phased-write`
+          );
+          entry.writeResponseOk = true;
+          writeDone++;
+
+          if (Number(state.netRetrySeq || 0) > seqBefore) {
+            entry.degraded = true;
+            entry.healthReasons.add('write-network-retry');
+          }
+
+          addLog(
+            `${labels[op]} WRITE OK: CHƯƠNG ${entry.item.chapterNo}`,
+            'ok'
+          );
+        } catch (err) {
+          // Không retry ở đây. Response rớt không đồng nghĩa server chưa commit.
+          entry.writeError = err;
+          entry.degraded = true;
+          entry.healthReasons.add('put-response-error');
+          ambiguousWrites++;
+          writeDone++;
+
+          addLog(
+            `${labels[op]} WRITE AMBIGUOUS CHƯƠNG ${entry.item.chapterNo}: ${err.message}. ` +
+            `Không retry ngay; chờ VERIFY xác định trạng thái server.`,
+            'warn'
+          );
+        }
+
+        setStatus(
+          `${labels[op]} · WRITE ${writeDone}/${writable.length} · ambiguous ${ambiguousWrites}`
+        );
+      },
+    });
+
+    entries.forEach(e => { delete e.phaseTouched; });
+
+    // Nếu user hủy giữa WRITE, tuyệt đối không ghi thêm, nhưng vẫn VERIFY
+    // những request đã thực sự được gửi để biết server đang ở trạng thái nào.
+    const written = writable.filter(e => e.writeAttempted);
+
+    addLog(
+      `${labels[op]} WRITE hoàn tất: ${written.length} đã gửi · ` +
+      `${ambiguousWrites} response bất định.`,
+      ambiguousWrites ? 'warn' : 'ok'
+    );
+
+    await sleep(phaseCooldown + jitter(220));
+
+    // -------------------- PHASE 3: VERIFY --------------------
+    // Verify=OFF vẫn bắt buộc hậu kiểm những PUT response bị rớt.
+    const verifyTargets = written.filter(e => verify || e.writeError);
+
+    let verifiedCount = 0;
+    let verifyFailed = 0;
+
+    if (verifyTargets.length) {
+      setStatus(`${labels[op]} · VERIFY 0/${verifyTargets.length}`);
+
+      await runSmoothUpdatePhase({
+        name: `${labels[op]} VERIFY`,
+        entries: verifyTargets,
+        concurrency: verifyConcurrency,
+        startGapMs: effectiveGap,
+        stopOnTaskError: false,
+        respectCancel: false, // Đã WRITE thì cancel cũng phải hậu kiểm.
+        task: async (entry) => {
+          entry.phaseTouched = true;
+          const seqBefore = Number(state.netRetrySeq || 0);
+
+          try {
+            const vr = await verifyChapterWithRetry(
+              entry.row,
+              entry.expected,
+              `CHƯƠNG ${entry.item.chapterNo} phased-verify`
+            );
+
+            entry.verified = true;
+            verifiedCount++;
+
+            if (vr.attempts > 1) {
+              entry.degraded = true;
+              entry.healthReasons.add('verify-retry');
+            }
+            if (Number(state.netRetrySeq || 0) > seqBefore) {
+              entry.degraded = true;
+              entry.healthReasons.add('verify-get-retry');
+            }
+
+            if (entry.writeError) {
+              entry.recovered = true;
+              entry.healthReasons.add('put-response-lost-but-committed');
+              addLog(
+                `${labels[op]} VERIFY PASS: CHƯƠNG ${entry.item.chapterNo} · ` +
+                `PUT response bị rớt nhưng server đã commit đúng.`,
+                'warn'
+              );
+            } else {
+              addLog(
+                `${labels[op]} VERIFY PASS: CHƯƠNG ${entry.item.chapterNo}` +
+                `${entry.degraded ? ' · DEGRADED' : ''}`,
+                entry.degraded ? 'warn' : 'ok'
+              );
+            }
+          } catch (err) {
+            entry.finalError = err;
+            verifyFailed++;
+            addLog(
+              `${labels[op]} VERIFY CHƯA PASS CHƯƠNG ${entry.item.chapterNo}: ${err.message}`,
+              'error'
+            );
+          }
+
+          setStatus(
+            `${labels[op]} · VERIFY ${verifiedCount + verifyFailed}/${verifyTargets.length} · ` +
+            `PASS ${verifiedCount} · cần recovery ${verifyFailed}`
+          );
+        },
+      });
+
+      verifyTargets.forEach(e => { delete e.phaseTouched; });
+    }
+
+    // verify OFF: PUT HTTP OK được coi là hoàn tất; ambiguous vẫn đã verify ở trên.
+    if (!verify) {
+      for (const entry of written) {
+        if (!entry.writeError && !entry.finalError) entry.verified = true;
+      }
+    }
+
+    // -------------------- PHASE 4: RECOVERY --------------------
+    const recoveryTargets = written.filter(e => !e.verified);
+
+    if (recoveryTargets.length) {
+      addLog(
+        `${labels[op]} RECOVERY: ${recoveryTargets.length} chương chưa PASS. ` +
+        `Chuyển sang 1 luồng, retry idempotent từng chapter.`,
+        'warn'
+      );
+
+      await sleep(Math.max(900, phaseCooldown) + jitter(250));
+
+      for (let i = 0; i < recoveryTargets.length; i++) {
+        const entry = recoveryTargets[i];
+
+        if (state.cancelled) {
+          entry.finalError ||= new Error('Đã hủy trước recovery.');
+          continue;
+        }
+
+        try {
+          const result = await updateExistingChapterOne(
+            entry.item,
+            op,
+            true,
+            `RECOVERY ${i + 1}/${recoveryTargets.length}`
+          );
+
+          entry.verified = true;
+          entry.recovered = true;
+          entry.finalError = null;
+          entry.degraded = true;
+          entry.healthReasons.add('sequential-recovery');
+
+          addLog(
+            `${labels[op]} RECOVERY PASS: CHƯƠNG ${entry.item.chapterNo}`,
+            'ok'
+          );
+
+          // Recovery là tín hiệu server vừa chập chờn, cho host nghỉ ngắn.
+          if (i + 1 < recoveryTargets.length) {
+            await sleep(700 + jitter(250));
+          }
+        } catch (err) {
+          entry.finalError = err;
+          addLog(
+            `${labels[op]} RECOVERY LỖI CHƯƠNG ${entry.item.chapterNo}: ${err.message}`,
+            'error'
+          );
+
+          if (stopError) break;
+        }
+      }
+    }
+
+    const successful = written.filter(e => e.verified && !e.finalError);
+    const failed = entries.filter(e => e.finalError || (e.writeAttempted && !e.verified));
+    const notWritten = entries.filter(e => !e.writeAttempted);
+
+    const clean = successful.filter(e => !e.degraded).length;
+    const degraded = successful.length - clean;
+
+    addLog(
+      `${labels[op]} pipeline hoàn tất: ${successful.length} PASS ` +
+      `(${clean} CLEAN, ${degraded} DEGRADED/recovered) · ${failed.length} lỗi · ` +
+      `${notWritten.length} chưa ghi.`,
+      failed.length ? 'warn' : 'ok'
+    );
+
+    if (failed.length && stopError) {
+      const first = failed[0];
+      throw new Error(
+        `${labels[op]} còn ${failed.length} chương chưa PASS. ` +
+        `Đầu tiên: CHƯƠNG ${first.item.chapterNo} · ${first.finalError?.message || 'verify failed'}`
+      );
+    }
+
+    return {
+      ok: successful.length,
+      errors: failed.length,
+      completed: successful.length + failed.length,
+      unstarted: notWritten.length,
+      clean,
+      degraded,
+      ambiguousWrites,
+    };
+  }
+
   async function runBulk() {
     if (state.running) return;
     if (!state.selectedStoryId) return toast('Chưa chọn truyện.', 'warn');
@@ -1978,8 +3099,11 @@
       await loadChapters();
       initializeExistingPricing(false);
     } else if (op === 'create') {
-      // Một refresh trước validation là đủ. Sau mỗi POST, loadChapters()
-      // bên dưới vừa re-check vừa tạo snapshot mới cho vòng kế tiếp.
+      // Snapshot trước native bulk. Chỉ một POST create cho toàn batch.
+      await loadChapters();
+    } else if (isParallelChapterUpdateOperation(op)) {
+      // Refresh mapping chapterNo -> chapterId ngay trước update pipeline.
+      // Parsed TXT vẫn giữ nguyên; chỉ trạng thái server/mapping được làm mới.
       await loadChapters();
     }
 
@@ -2014,6 +3138,7 @@
           return toast(`Dải đăng mới không liên tục tại CHƯƠNG ${sorted[i].chapterNo}.`, 'error', 6000);
         }
       }
+      items = sorted;
     }
 
     const labels = {
@@ -2024,7 +3149,12 @@
       create: 'ĐĂNG CHƯƠNG MỚI',
     };
 
-    if (!confirm(`${labels[op]}\n\nTruyện #${state.selectedStoryId}\nSố chương: ${items.length}\n\nĐây là thao tác thật lên server. Tiếp tục?`)) return;
+    const confirmExtra = op === 'create'
+      ? '\n\nChương sẽ được tạo hàng loạt, kiểm tra lại, rồi áp giá đã chọn.'
+      : isParallelChapterUpdateOperation(op)
+        ? '\n\nNội dung sẽ được cập nhật và kiểm tra lại sau khi lưu.'
+        : '';
+    if (!confirm(`${labels[op]}\n\nTruyện #${state.selectedStoryId} · ${items.length} chương${confirmExtra}\n\nTiếp tục?`)) return;
 
     state.running = true;
     state.cancelled = false;
@@ -2040,90 +3170,39 @@
     let errors = 0;
 
     try {
-      let createModel = null;
-      if (op === 'create') createModel = await getCreateChapterModel();
+      if (op === 'create') {
+        const result = await runNativeBulkCreate(items, verify, stopError, delayMs, labels);
+        ok += result.ok;
+        errors += result.errors;
+      } else if (isParallelChapterUpdateOperation(op)) {
+        const result = await runParallelChapterUpdates(items, op, verify, stopError, delayMs, labels);
+        ok += result.ok;
+        errors += result.errors;
+      } else {
+        // price_update giữ nguyên engine tuần tự cũ để không thay semantics pricing trong patch này.
+        for (let i = 0; i < items.length; i++) {
+          if (state.cancelled) {
+            addLog('Bulk: đã hủy trước request kế tiếp.', 'warn');
+            break;
+          }
 
-      for (let i = 0; i < items.length; i++) {
-        if (state.cancelled) {
-          addLog('Bulk: đã hủy trước request kế tiếp.', 'warn');
-          break;
-        }
+          const item = items[i];
+          setStatus(`${labels[op]} ${i + 1}/${items.length}: CHƯƠNG ${item.chapterNo}`);
 
-        const item = items[i];
-        setStatus(`${labels[op]} ${i + 1}/${items.length}: CHƯƠNG ${item.chapterNo}`);
-
-        try {
-          if (op === 'create') {
-            // state.chapters luôn là snapshot mới nhất: refresh trước batch
-            // hoặc re-check sau POST của chương trước.
-            const maxNow = state.chapters.length ? Math.max(...state.chapters.map(x => x.chapterNo)) : 0;
-            if (item.chapterNo !== maxNow + 1) {
-              const exists = state.chapterMap.get(item.chapterNo);
-              if (exists && sanitizeChapterTitle(exists.title, null) === sanitizeChapterTitle(item.title, item.chapterNo)) {
-                addLog(`Bỏ qua CHƯƠNG ${item.chapterNo}: đã tồn tại đúng tên.`, 'warn');
-                ok++;
-                continue;
-              }
-              throw new Error(`Thứ tự server đổi: chương cuối=${maxNow}, đang chuẩn bị=${item.chapterNo}`);
-            }
-
-            const price = pricingFields(getPricing(item.chapterNo), item.chapterNo);
-            const params = modelToParams(createModel, {
-              name_chapter: sanitizeChapterTitle(item.title, item.chapterNo),
-              content_chapter: item.htmlContent,
-              word_count2: String(countWordsFromHtml(item.htmlContent)),
-              post_id: String(state.selectedStoryId),
-              publish_mode: 'now',
-              publish_at: '',
-              stars_active: price.stars_active,
-              diamonds_active: price.diamonds_active,
-            });
-
-            let postError = null;
-            try {
-              await postOnce(createModel.action, {
-                rawMethod: createModel.rawMethod || 'POST',
-                body: params.toString(),
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-                label: `POST CHƯƠNG ${item.chapterNo}`,
-              });
-            } catch (err) {
-              postError = err;
-              addLog(`POST CHƯƠNG ${item.chapterNo} bất định: ${err.message}; đang xác minh server…`, 'warn');
-            }
-
-            await sleep(500);
-            await loadChapters();
+          try {
             const row = state.chapterMap.get(item.chapterNo);
-            if (!row) throw postError || new Error('POST trả về nhưng chương chưa xuất hiện.');
-            if (sanitizeChapterTitle(row.title, null) !== sanitizeChapterTitle(item.title, item.chapterNo)) {
-              throw new Error(`Chương xuất hiện nhưng tên không khớp: web="${row.title}"`);
-            }
-            const targetP = getPricing(item.chapterNo);
-            if (!priceMatchesRow(targetP, row)) {
-              throw new Error(`Giá sau tạo không khớp: web=${row.stars} sao/${row.diamonds} KC, cần=${pricingLabel(targetP)}`);
-            }
-          } else {
-            const row = state.chapterMap.get(item.chapterNo);
-            const snap = await fetchChapterSnapshot(row, op === 'price_update');
+            const snap = await fetchChapterSnapshot(row, true);
             const overrides = {};
             const expected = {};
 
-            if (op === 'both' || op === 'title') {
-              overrides.name_chapter = sanitizeChapterTitle(item.title, item.chapterNo);
-              expected.name = overrides.name_chapter;
-            }
-            if (op === 'both' || op === 'content') {
-              overrides.content_chapter = item.htmlContent;
-              overrides.word_count2 = String(countWordsFromHtml(item.htmlContent));
-              expected.content = item.htmlContent;
-            }
             if (op === 'price_update') {
               const pf = pricingFields(getPricing(item.chapterNo), item.chapterNo);
               overrides.stars_active = pf.stars_active;
               overrides.diamonds_active = pf.diamonds_active;
               expected.stars = Number(pf.stars_active || 0);
               expected.diamonds = Number(pf.diamonds_active || 0);
+            } else {
+              throw new Error(`Operation "${op}" chưa có engine xử lý.`);
             }
 
             await submitChapterOverrides(snap, overrides, `UPDATE CHƯƠNG ${item.chapterNo}`);
@@ -2131,31 +3210,40 @@
               await sleep(350 + jitter(180));
               await verifyChapter(row, expected);
             }
+
+            ok++;
+            addLog(`${labels[op]} OK: CHƯƠNG ${item.chapterNo}`, 'ok');
+          } catch (err) {
+            errors++;
+            addLog(`${labels[op]} LỖI CHƯƠNG ${item.chapterNo}: ${err.message}`, 'error');
+            if (stopError) throw err;
           }
 
-          ok++;
-          addLog(`${labels[op]} OK: CHƯƠNG ${item.chapterNo}`, 'ok');
-        } catch (err) {
-          errors++;
-          addLog(`${labels[op]} LỖI CHƯƠNG ${item.chapterNo}: ${err.message}`, 'error');
-          if (stopError) throw err;
-        }
-
-        if (i + 1 < items.length) {
-          if ((i + 1) % CFG.bulkCooldownEvery === 0) {
-            await sleep(CFG.bulkCooldownMs);
-          } else if (delayMs) {
-            await sleep(delayMs + jitter(220));
+          if (i + 1 < items.length) {
+            if ((i + 1) % CFG.bulkCooldownEvery === 0) {
+              await sleep(CFG.bulkCooldownMs);
+            } else if (delayMs) {
+              await sleep(delayMs + jitter(220));
+            }
           }
         }
       }
 
+      // Cho server lắng ngắn trước khi quét lại danh sách sau update.
+      if (isParallelChapterUpdateOperation(op)) {
+        await sleep(900 + jitter(300));
+      }
       await loadChapters();
       setStatus(`Bulk hoàn tất: thành công ${ok}, lỗi ${errors}.`, errors ? 'warn' : 'ok');
       toast(`Bulk hoàn tất: ${ok} OK / ${errors} lỗi.`, errors ? 'warn' : 'ok', 5000);
     } catch (err) {
       setStatus(`Bulk dừng: ${err.message}`, 'error');
-      toast(`Bulk dừng: ${err.message}`, 'error', 6500);
+      toast(`Bulk dừng: ${err.message}`, 'error', 7500);
+      // Sau lỗi vẫn refresh trạng thái thật, nhưng cho host nghỉ ngắn trước GET.
+      try {
+        if (isParallelChapterUpdateOperation(op)) await sleep(1800 + jitter(500));
+        await loadChapters();
+      } catch {}
     } finally {
       state.running = false;
       if (runBtn) runBtn.disabled = false;
@@ -2185,10 +3273,11 @@
     set('#ttlcc-stat-shortpaid', shortPaid.toLocaleString());
 
     const warn = $('#ttlcc-dashboard-warning');
-    if (warn) {
-      warn.style.display = shortPaid ? '' : 'none';
-      warn.textContent = shortPaid
-        ? `Phát hiện ${shortPaid} CHƯƠNG dưới 1000 từ nhưng vẫn đang trả phí. Có thể sửa ngay ở tab Bulk → Fix giá.`
+    const warnText = $('#ttlcc-dashboard-warning-text');
+    if (warn) warn.style.display = shortPaid ? '' : 'none';
+    if (warnText) {
+      warnText.textContent = shortPaid
+        ? `${shortPaid} chương dưới 1000 từ đang có giá mở khóa.`
         : '';
     }
   }
@@ -3177,80 +4266,330 @@
   // ==========================================================
 
   const CSS_TEXT = `
-    :root {
-      --ttlcc-bg:#10151c;
-      --ttlcc-panel:#171e27;
-      --ttlcc-panel2:#1c2530;
-      --ttlcc-input:#111922;
-      --ttlcc-border:#2d3947;
-      --ttlcc-text:#d7dee7;
-      --ttlcc-soft:#a8b4c1;
-      --ttlcc-muted:#788697;
-      --ttlcc-primary:#5f95a1;
-      --ttlcc-primary2:#75aab5;
-      --ttlcc-ok:#79a184;
-      --ttlcc-warn:#c09a62;
-      --ttlcc-danger:#b46268;
-      --ttlcc-shadow:0 24px 65px rgba(0,0,0,.42);
+    :root{
+      --ttlcc-bg:#0b1016;
+      --ttlcc-surface:#111821;
+      --ttlcc-surface2:#151e28;
+      --ttlcc-surface3:#1a2531;
+      --ttlcc-input:#0e151d;
+      --ttlcc-border:#263341;
+      --ttlcc-border-soft:#1d2833;
+      --ttlcc-text:#e2e8ef;
+      --ttlcc-soft:#aeb9c5;
+      --ttlcc-muted:#748292;
+      --ttlcc-primary:#6f9fac;
+      --ttlcc-primary-hover:#82b0bb;
+      --ttlcc-primary-soft:rgba(111,159,172,.13);
+      --ttlcc-ok:#7fa58a;
+      --ttlcc-warn:#c49b60;
+      --ttlcc-danger:#b96a70;
+      --ttlcc-shadow:0 24px 70px rgba(0,0,0,.48);
+      --ttlcc-radius:12px;
     }
+
     #ttlcc-panel,#ttlcc-panel *{box-sizing:border-box}
-    #ttlcc-panel{position:fixed;z-index:2147483000;top:14px;right:14px;width:min(980px,calc(100vw - 28px));height:min(730px,calc(100vh - 28px));max-height:calc(100vh - 28px);background:var(--ttlcc-bg);color:var(--ttlcc-text);border:1px solid var(--ttlcc-border);border-radius:13px;box-shadow:var(--ttlcc-shadow);font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;overflow:hidden;display:flex;flex-direction:column}
-    #ttlcc-panel.ttlcc-minimized{top:auto;right:78px;bottom:16px;width:68px;height:36px;max-height:36px;border-radius:10px;cursor:pointer}
-    #ttlcc-panel.ttlcc-minimized .ttlcc-main,#ttlcc-panel.ttlcc-minimized .ttlcc-tabs,#ttlcc-panel.ttlcc-minimized .ttlcc-selection{display:none!important}
-    #ttlcc-panel.ttlcc-minimized .ttlcc-head{height:34px;min-height:34px;padding:0;justify-content:center;cursor:pointer;background:linear-gradient(135deg,#293a43,#355149)}
-    #ttlcc-panel.ttlcc-minimized .ttlcc-head-main{display:flex;align-items:center;justify-content:center}
-    #ttlcc-panel.ttlcc-minimized .ttlcc-head-title{font-size:0;line-height:1}
-    #ttlcc-panel.ttlcc-minimized .ttlcc-head-title::after{content:"TTL";font-size:12px;font-weight:850;letter-spacing:.5px}
-    #ttlcc-panel.ttlcc-minimized .ttlcc-head-sub,#ttlcc-panel.ttlcc-minimized .ttlcc-head-actions{display:none!important}
-    .ttlcc-head{display:flex;align-items:center;justify-content:space-between;gap:9px;padding:9px 11px;background:linear-gradient(135deg,#293a43,#314b53 55%,#355149);color:white}
-    .ttlcc-head-main{min-width:0}.ttlcc-head-title{font-size:15px;font-weight:800}.ttlcc-head-sub{font-size:10px;opacity:.74;margin-top:1px}
-    .ttlcc-head-actions{display:flex;align-items:center;gap:5px}.ttlcc-badge{padding:3px 7px;border-radius:999px;background:rgba(255,255,255,.12);font-size:10px;font-weight:700}
-    .ttlcc-icon{width:30px;height:30px;border:1px solid rgba(255,255,255,.25);border-radius:8px;background:rgba(255,255,255,.10);color:#fff;cursor:pointer}
-    .ttlcc-selection{display:flex;align-items:center;gap:8px;padding:7px 10px;background:var(--ttlcc-panel);border-bottom:1px solid var(--ttlcc-border)}
-    .ttlcc-selection-main{min-width:0;flex:1}.ttlcc-selected-title{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ttlcc-selected-sub{font-size:11px;color:var(--ttlcc-muted)}
-    .ttlcc-tabs{display:flex;gap:3px;padding:5px 8px;background:#131a22;border-bottom:1px solid var(--ttlcc-border);overflow:auto}
-    .ttlcc-tab-btn{border:1px solid transparent;background:transparent;color:var(--ttlcc-soft);padding:5px 9px;border-radius:7px;cursor:pointer;white-space:nowrap;font-weight:700;font-size:11.5px}
-    .ttlcc-tab-btn.active{background:var(--ttlcc-panel2);border-color:var(--ttlcc-border);color:#fff}
-    .ttlcc-main{min-height:0;flex:1;overflow:auto;padding:8px}
+    #ttlcc-panel{
+      position:fixed;z-index:2147483000;top:16px;right:16px;
+      width:min(1040px,calc(100vw - 32px));height:min(760px,calc(100vh - 32px));
+      max-height:calc(100vh - 32px);display:flex;flex-direction:column;overflow:hidden;
+      background:var(--ttlcc-bg);color:var(--ttlcc-text);
+      border:1px solid var(--ttlcc-border);border-radius:16px;box-shadow:var(--ttlcc-shadow);
+      font:12px/1.45 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+    }
+    #ttlcc-panel button,#ttlcc-panel input,#ttlcc-panel select,#ttlcc-panel textarea{font:inherit}
+    #ttlcc-panel ::-webkit-scrollbar{width:8px;height:8px}
+    #ttlcc-panel ::-webkit-scrollbar-thumb{background:#2c3947;border-radius:8px}
+    #ttlcc-panel ::-webkit-scrollbar-track{background:transparent}
+
+    #ttlcc-panel.ttlcc-minimized{
+      top:auto;right:18px;bottom:18px;width:62px;height:38px;max-height:38px;border-radius:12px;cursor:pointer
+    }
+    #ttlcc-panel.ttlcc-minimized .ttlcc-main,
+    #ttlcc-panel.ttlcc-minimized .ttlcc-tabs,
+    #ttlcc-panel.ttlcc-minimized .ttlcc-context{display:none!important}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-head{height:36px;min-height:36px;padding:0;justify-content:center;border:0}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-brand{display:flex;align-items:center;justify-content:center}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-brand-name{font-size:0}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-brand-name::after{content:"TTL";font-size:12px;font-weight:900;letter-spacing:.7px}
+    #ttlcc-panel.ttlcc-minimized .ttlcc-brand-ver,
+    #ttlcc-panel.ttlcc-minimized .ttlcc-head-actions{display:none!important}
+
+    .ttlcc-head{
+      min-height:52px;display:flex;align-items:center;justify-content:space-between;gap:12px;
+      padding:10px 13px;border-bottom:1px solid var(--ttlcc-border-soft);background:#0e141c
+    }
+    .ttlcc-brand{min-width:0;display:flex;align-items:baseline;gap:8px}
+    .ttlcc-brand-name{font-size:15px;font-weight:850;letter-spacing:.1px;color:#f1f5f8}
+    .ttlcc-brand-ver{font-size:10px;color:var(--ttlcc-muted);font-weight:700}
+    .ttlcc-head-actions{display:flex;align-items:center;gap:5px}
+    .ttlcc-story-badge{
+      display:inline-flex;align-items:center;height:28px;padding:0 9px;border-radius:8px;
+      background:var(--ttlcc-surface2);border:1px solid var(--ttlcc-border);color:var(--ttlcc-soft);
+      font-size:10.5px;font-weight:800
+    }
+    .ttlcc-icon{
+      width:30px;height:30px;display:inline-grid;place-items:center;border-radius:8px;
+      border:1px solid var(--ttlcc-border);background:var(--ttlcc-surface2);color:var(--ttlcc-soft);
+      cursor:pointer;transition:.15s ease
+    }
+    .ttlcc-icon:hover{background:var(--ttlcc-surface3);color:#fff;border-color:#3a4b5c}
+
+    .ttlcc-context{
+      min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:12px;
+      padding:7px 12px;background:var(--ttlcc-surface);border-bottom:1px solid var(--ttlcc-border-soft)
+    }
+    .ttlcc-selection-main{min-width:0;display:flex;align-items:baseline;gap:8px;flex:1}
+    .ttlcc-selected-title{font-size:12.5px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ttlcc-selected-sub{font-size:10.5px;color:var(--ttlcc-muted);white-space:nowrap}
+    .ttlcc-status{
+      max-width:52%;padding:5px 9px;border-radius:8px;background:#16212a;color:#aebfc9;
+      border:1px solid transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10.5px
+    }
+    .ttlcc-status.ok{color:#a8c8b0;background:rgba(127,165,138,.09)}
+    .ttlcc-status.warn{color:#d8b47d;background:rgba(196,155,96,.09)}
+    .ttlcc-status.error{color:#dd969b;background:rgba(185,106,112,.10)}
+
+    .ttlcc-tabs{
+      display:flex;gap:4px;padding:6px 12px;background:#0d131a;border-bottom:1px solid var(--ttlcc-border-soft);overflow-x:auto;overflow-y:hidden;scrollbar-width:none
+    }
+    .ttlcc-tabs::-webkit-scrollbar{display:none}
+    .ttlcc-tab-btn{
+      min-height:30px;border:0;background:transparent;color:var(--ttlcc-muted);padding:5px 10px;border-radius:8px;
+      cursor:pointer;white-space:nowrap;font-weight:750;font-size:11.5px;transition:.15s ease
+    }
+    .ttlcc-tab-btn:hover{color:var(--ttlcc-text);background:rgba(255,255,255,.035)}
+    .ttlcc-tab-btn.active{background:var(--ttlcc-primary-soft);color:#c8dfe4}
+
+    .ttlcc-main{min-height:0;flex:1;overflow-y:auto;overflow-x:hidden;padding:14px 16px 24px;scrollbar-gutter:stable}
     .ttlcc-pane{display:none}.ttlcc-pane.active{display:block}
-    .ttlcc-grid2{display:grid;grid-template-columns:minmax(240px,300px) minmax(0,1fr);gap:8px}.ttlcc-grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
-    .ttlcc-card{background:var(--ttlcc-panel);border:1px solid var(--ttlcc-border);border-radius:9px;padding:9px;margin-bottom:8px}.ttlcc-card-title{font-weight:800;margin-bottom:7px;display:flex;align-items:center;justify-content:space-between;gap:6px}
-    .ttlcc-toolbar{display:flex;align-items:center;gap:5px;flex-wrap:wrap}.ttlcc-toolbar + .ttlcc-toolbar{margin-top:6px}
-    .ttlcc-input,.ttlcc-card input[type="text"],.ttlcc-card input[type="number"],.ttlcc-card input[type="date"],.ttlcc-card input[type="datetime-local"],.ttlcc-card input[type="url"],.ttlcc-card input[type="file"],.ttlcc-card select,.ttlcc-live-form input,.ttlcc-live-form select,.ttlcc-live-form textarea{border:1px solid var(--ttlcc-border);background:var(--ttlcc-input);color:var(--ttlcc-text);border-radius:7px;padding:5px 7px;outline:none;max-width:100%;font-size:11.5px}
-    .ttlcc-input:focus,.ttlcc-live-form input:focus,.ttlcc-live-form select:focus,.ttlcc-live-form textarea:focus{border-color:var(--ttlcc-primary);box-shadow:0 0 0 3px rgba(95,149,161,.12)}
-    .ttlcc-btn{border:1px solid transparent;border-radius:7px;padding:5px 8px;min-height:28px;cursor:pointer;font-weight:700;background:var(--ttlcc-panel2);color:var(--ttlcc-text);font-size:11.5px}.ttlcc-btn:disabled{opacity:.42;cursor:not-allowed}
-    .ttlcc-btn-primary{background:var(--ttlcc-primary);color:white}.ttlcc-btn-primary:hover:not(:disabled){background:var(--ttlcc-primary2)}.ttlcc-btn-soft{border-color:var(--ttlcc-border)}.ttlcc-btn-danger{background:var(--ttlcc-danger);color:white}.ttlcc-btn-mini{padding:4px 7px;min-height:26px;font-size:11px}
-    .ttlcc-story-list{max-height:470px;overflow:auto;display:flex;flex-direction:column;gap:4px}.ttlcc-story-item{border:1px solid var(--ttlcc-border);background:#131a22;color:var(--ttlcc-text);border-radius:7px;padding:7px 8px;text-align:left;cursor:pointer;display:flex;align-items:center;gap:6px}.ttlcc-story-item.active{border-color:var(--ttlcc-primary);background:#1b2931}.ttlcc-story-title{flex:1;font-weight:700}.ttlcc-story-id{color:var(--ttlcc-muted);font-size:10px}
-    .ttlcc-stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px}.ttlcc-stat{border:1px solid var(--ttlcc-border);background:var(--ttlcc-panel);border-radius:9px;padding:9px}.ttlcc-stat-label{font-size:10px;color:var(--ttlcc-muted)}.ttlcc-stat-value{font-size:16px;font-weight:800;margin-top:2px;overflow:hidden;text-overflow:ellipsis}
-    .ttlcc-warning{border:1px solid rgba(192,154,98,.45);background:rgba(192,154,98,.08);color:#d8bb8e;padding:9px 11px;border-radius:9px;margin-top:10px}
-    .ttlcc-status{padding:7px 10px;border-radius:8px;background:#18242d;color:#b7c8d0}.ttlcc-status.ok{color:#9fc3a8}.ttlcc-status.warn{color:#d5b37f}.ttlcc-status.error{color:#dc9599}
-    .ttlcc-table-wrap{overflow:auto;max-height:500px;border:1px solid var(--ttlcc-border);border-radius:8px}.ttlcc-table{width:100%;border-collapse:collapse;font-size:11.25px}.ttlcc-table th{position:sticky;top:0;z-index:2;background:#1c2530;color:#c9d2dc;text-align:left}.ttlcc-table th,.ttlcc-table td{padding:5px 6px;border-bottom:1px solid #273240;vertical-align:top}.ttlcc-table tr:hover td{background:#151e27}.ttlcc-table td:not(.ttlcc-left){white-space:nowrap}.ttlcc-row-actions{display:flex;gap:4px}.ttlcc-row-warn td{background:rgba(192,154,98,.05)}.ttlcc-mini-warn{font-size:9px;color:#d3aa72;white-space:normal;max-width:120px}
-    .ttlcc-live-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.ttlcc-field{display:flex;flex-direction:column;gap:3px}.ttlcc-field-wide{grid-column:1/-1}.ttlcc-label{font-weight:700;color:var(--ttlcc-soft);font-size:10.5px}.ttlcc-live-form textarea{width:100%;resize:vertical}.ttlcc-code-area{font:11.5px/1.45 Consolas,"SFMono-Regular",monospace}.ttlcc-choice-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.ttlcc-choice{display:flex;gap:5px;align-items:flex-start;padding:5px 6px;border:1px solid #2b3744;border-radius:6px;background:#121922;font-size:10px}.ttlcc-form-actions{display:flex;justify-content:flex-end;gap:5px}.ttlcc-form-title{font-size:13px;font-weight:800;margin-bottom:7px;color:#fff}
-    .ttlcc-empty,.ttlcc-loading{padding:14px;color:var(--ttlcc-muted);text-align:center}.ttlcc-error-box{padding:10px;border:1px solid rgba(180,98,104,.5);background:rgba(180,98,104,.08);border-radius:9px;color:#dc9599}.ttlcc-error-box .ttlcc-btn{margin-top:8px}
-    .ttlcc-bulk-layout{display:grid;grid-template-columns:295px minmax(0,1fr);gap:8px}.ttlcc-textarea{width:100%;min-height:185px;resize:vertical;border:1px solid var(--ttlcc-border);background:var(--ttlcc-input);color:var(--ttlcc-text);border-radius:7px;padding:7px;font:11.25px/1.45 Consolas,monospace}.ttlcc-inline-price{display:flex;gap:3px}.ttlcc-inline-price select{width:68px}.ttlcc-inline-price input{width:48px}.ttlcc-price-lock{color:#91b39a;font-weight:700}.ttlcc-state{font-weight:800;font-size:9px}.ttlcc-state.pending{color:#d1ad76}.ttlcc-state.ok{color:#88ad91}.ttlcc-state.bad{color:#d1858a}
-    .ttlcc-log{height:135px;overflow:auto;background:#0d1319;border:1px solid #222e39;border-radius:7px;padding:6px;font:10.5px/1.45 Consolas,monospace}.ttlcc-log-line.ok{color:#8fb69a}.ttlcc-log-line.warn{color:#d0aa74}.ttlcc-log-line.error{color:#d4858a}.ttlcc-log-line.info{color:#abb6c2}
-    #ttlcc-modal{position:fixed;z-index:2147483200;inset:0;background:rgba(0,0,0,.66);display:none;align-items:center;justify-content:center;padding:14px}#ttlcc-modal.open{display:flex}.ttlcc-modal-box{width:min(900px,95vw);max-height:90vh;display:flex;flex-direction:column;background:var(--ttlcc-bg);border:1px solid var(--ttlcc-border);border-radius:11px;box-shadow:var(--ttlcc-shadow)}.ttlcc-modal-head{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:var(--ttlcc-panel2);border-bottom:1px solid var(--ttlcc-border);font-weight:800}.ttlcc-modal-body{overflow:auto;padding:9px}
-    #ttlcc-toast-host{position:fixed;z-index:2147483300;right:22px;bottom:22px;display:flex;flex-direction:column;gap:7px;pointer-events:none}.ttlcc-toast{max-width:420px;padding:9px 11px;border-radius:9px;background:#25313d;color:#fff;box-shadow:0 10px 28px rgba(0,0,0,.35);opacity:1;transform:translateY(0);transition:.2s}.ttlcc-toast.ok{background:#355344}.ttlcc-toast.warn{background:#665235}.ttlcc-toast.error{background:#6a393e}.ttlcc-toast.out{opacity:0;transform:translateY(8px)}
-    .ttlcc-revenue-top{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-bottom:8px}
-    .ttlcc-revenue-summary{border:1px solid var(--ttlcc-border);background:var(--ttlcc-panel);border-radius:9px;padding:9px;min-width:0}
-    .ttlcc-revenue-summary-label{font-size:10px;color:var(--ttlcc-muted);font-weight:700}
-    .ttlcc-revenue-summary-value{margin-top:3px;font-size:17px;font-weight:850;color:#f4f7fa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+    .ttlcc-card{
+      background:transparent;border:0;border-radius:0;
+      padding:0 0 14px;margin:0 0 14px;border-bottom:1px solid var(--ttlcc-border-soft)
+    }
+    .ttlcc-card:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
+    .ttlcc-card-title{
+      min-height:24px;margin-bottom:9px;display:flex;align-items:center;justify-content:space-between;gap:8px;
+      font-size:12px;font-weight:850;color:#e9eef3
+    }
+    .ttlcc-section-sub{font-size:10.5px;color:var(--ttlcc-muted);font-weight:600}
+    .ttlcc-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+    .ttlcc-toolbar + .ttlcc-toolbar{margin-top:7px}
+    .ttlcc-grid2{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);gap:10px}
+    .ttlcc-grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+
+    .ttlcc-input,.ttlcc-card input[type="text"],.ttlcc-card input[type="number"],
+    .ttlcc-card input[type="date"],.ttlcc-card input[type="datetime-local"],.ttlcc-card input[type="url"],
+    .ttlcc-card input[type="file"],.ttlcc-card select,.ttlcc-live-form input,.ttlcc-live-form select,.ttlcc-live-form textarea{
+      min-height:32px;border:1px solid var(--ttlcc-border);background:var(--ttlcc-input);color:var(--ttlcc-text);
+      border-radius:8px;padding:6px 8px;outline:none;max-width:100%;font-size:11.5px
+    }
+    .ttlcc-input:focus,.ttlcc-card input:focus,.ttlcc-card select:focus,.ttlcc-card textarea:focus,
+    .ttlcc-live-form input:focus,.ttlcc-live-form select:focus,.ttlcc-live-form textarea:focus{
+      border-color:var(--ttlcc-primary);box-shadow:0 0 0 3px rgba(111,159,172,.10)
+    }
+
+    .ttlcc-btn{
+      border:1px solid transparent;border-radius:8px;padding:5px 9px;min-height:30px;cursor:pointer;
+      font-weight:760;background:var(--ttlcc-surface2);color:var(--ttlcc-text);font-size:11.5px;transition:.15s ease
+    }
+    .ttlcc-btn:hover:not(:disabled){background:var(--ttlcc-surface3)}
+    .ttlcc-btn:disabled{opacity:.4;cursor:not-allowed}
+    .ttlcc-btn-primary{background:var(--ttlcc-primary);color:#081015}
+    .ttlcc-btn-primary:hover:not(:disabled){background:var(--ttlcc-primary-hover)}
+    .ttlcc-btn-soft{border-color:var(--ttlcc-border)}
+    .ttlcc-btn-danger{background:var(--ttlcc-danger);color:white}
+    .ttlcc-btn-ghost-danger{border-color:rgba(185,106,112,.35);background:transparent;color:#c98a8f}
+    .ttlcc-btn-ghost-danger:hover:not(:disabled){background:rgba(185,106,112,.10)}
+    .ttlcc-btn-mini{min-height:27px;padding:4px 7px;font-size:10.5px}
+    .ttlcc-btn-wide{width:100%}
+
+    .ttlcc-overview-hero{
+      display:flex;align-items:center;justify-content:space-between;gap:14px;
+      padding:14px 15px;border-radius:14px;background:linear-gradient(135deg,#121c25,#14212a);
+      border:1px solid var(--ttlcc-border-soft);margin-bottom:10px
+    }
+    .ttlcc-overview-story{min-width:0}
+    .ttlcc-overview-kicker{font-size:10px;color:var(--ttlcc-muted);font-weight:750;text-transform:uppercase;letter-spacing:.6px}
+    .ttlcc-overview-title{margin-top:3px;font-size:18px;font-weight:850;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ttlcc-quick-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+    .ttlcc-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:10px}
+    .ttlcc-stat{border:1px solid var(--ttlcc-border-soft);background:var(--ttlcc-surface);border-radius:11px;padding:10px 11px}
+    .ttlcc-stat-label{font-size:10px;color:var(--ttlcc-muted);font-weight:700}
+    .ttlcc-stat-value{font-size:18px;font-weight:850;margin-top:2px;overflow:hidden;text-overflow:ellipsis}
+    #ttlcc-stat-story{font-size:18px}
+    .ttlcc-warning{
+      display:flex;align-items:center;justify-content:space-between;gap:10px;
+      border:1px solid rgba(196,155,96,.28);background:rgba(196,155,96,.07);color:#d8b47d;
+      padding:9px 11px;border-radius:10px;margin-bottom:10px
+    }
+
+    .ttlcc-story-list{display:flex;flex-direction:column;gap:4px}
+    .ttlcc-story-item{
+      width:100%;border:1px solid transparent;background:transparent;color:var(--ttlcc-text);border-radius:9px;
+      padding:8px 9px;text-align:left;cursor:pointer;display:flex;align-items:center;gap:7px
+    }
+    .ttlcc-story-item:hover{background:rgba(255,255,255,.025)}
+    .ttlcc-story-item.active{border-color:rgba(111,159,172,.35);background:var(--ttlcc-primary-soft)}
+    .ttlcc-story-title{flex:1;font-weight:720;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .ttlcc-story-id{color:var(--ttlcc-muted);font-size:10px}
+
+    .ttlcc-table-wrap{overflow-x:auto;overflow-y:visible;max-height:none;border:1px solid var(--ttlcc-border-soft);border-radius:10px}
+    .ttlcc-table{width:100%;border-collapse:collapse;font-size:11.25px}
+    .ttlcc-table th{position:sticky;top:0;z-index:2;background:#121a23;color:#8f9dab;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.35px;box-shadow:0 1px 0 var(--ttlcc-border-soft)}
+    .ttlcc-table th,.ttlcc-table td{padding:7px 8px;border-bottom:1px solid var(--ttlcc-border-soft);vertical-align:middle}
+    .ttlcc-table tr:last-child td{border-bottom:0}
+    .ttlcc-table tr:hover td{background:rgba(255,255,255,.018)}
+    .ttlcc-table td:not(.ttlcc-left){white-space:nowrap}
+    .ttlcc-num{font-variant-numeric:tabular-nums;color:var(--ttlcc-soft);font-weight:760}
+    .ttlcc-chapter-title{font-weight:720;color:var(--ttlcc-text)}
+    .ttlcc-chapter-meta{margin-top:3px;display:flex;gap:4px;flex-wrap:wrap}
+    .ttlcc-meta-chip{font-size:9px;color:var(--ttlcc-muted)}
+    .ttlcc-row-actions{display:flex;gap:4px;justify-content:flex-end}
+    .ttlcc-row-warn td{background:rgba(196,155,96,.025)}
+    .ttlcc-price-chip{display:inline-flex;align-items:center;padding:2px 6px;border-radius:999px;font-size:9.5px;font-weight:800}
+    .ttlcc-price-chip.free{background:rgba(127,165,138,.10);color:#9fc3a8}
+    .ttlcc-price-chip.stars{background:rgba(196,155,96,.10);color:#d1ad76}
+    .ttlcc-price-chip.diamond{background:rgba(111,159,172,.13);color:#9bc5cf}
+    .ttlcc-alert-dot{
+      display:inline-grid;place-items:center;margin-left:4px;width:15px;height:15px;border-radius:50%;
+      background:rgba(196,155,96,.14);color:#d8b47d;font-size:9px;font-weight:900
+    }
+
+    .ttlcc-live-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+    .ttlcc-field{display:flex;flex-direction:column;gap:4px}
+    .ttlcc-field-wide{grid-column:1/-1}
+    .ttlcc-label{font-weight:750;color:var(--ttlcc-soft);font-size:10.5px}
+    .ttlcc-live-form textarea{width:100%;resize:vertical}
+    .ttlcc-code-area{font:11.5px/1.5 Consolas,"SFMono-Regular",monospace}
+    .ttlcc-choice-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}
+    .ttlcc-choice{display:flex;gap:5px;align-items:flex-start;padding:6px;border:1px solid var(--ttlcc-border-soft);border-radius:7px;background:var(--ttlcc-input);font-size:10px}
+    .ttlcc-form-actions{display:flex;justify-content:flex-end;gap:6px}
+    .ttlcc-form-title{font-size:13px;font-weight:850;margin-bottom:8px;color:#fff}
+
+    .ttlcc-empty,.ttlcc-loading{padding:18px;color:var(--ttlcc-muted);text-align:center}
+    .ttlcc-error-box{padding:10px;border:1px solid rgba(185,106,112,.35);background:rgba(185,106,112,.07);border-radius:10px;color:#d7989c}
+    .ttlcc-error-box .ttlcc-btn{margin-top:8px}
+
+    .ttlcc-bulk-layout{display:block}
+    .ttlcc-bulk-stack{display:block}
+    .ttlcc-bulk-stack .ttlcc-card{margin-bottom:0}
+    .ttlcc-bulk-command{
+      display:grid;grid-template-columns:minmax(190px,1.4fr) minmax(110px,.7fr) minmax(110px,.7fr) auto;
+      gap:10px;align-items:end;padding:2px 0 14px;border-bottom:1px solid var(--ttlcc-border-soft)
+    }
+    .ttlcc-bulk-command .ttlcc-advanced{
+      margin:0;padding:0;border:0;align-self:center;justify-self:end
+    }
+    .ttlcc-bulk-command .ttlcc-advanced[open]{
+      grid-column:1/-1;justify-self:stretch;padding-top:10px;border-top:1px solid var(--ttlcc-border-soft)
+    }
+    .ttlcc-bulk-command .ttlcc-advanced[open] summary{margin-bottom:8px}
+    .ttlcc-bulk-section{
+      padding:14px 0;border-bottom:1px solid var(--ttlcc-border-soft)
+    }
+    .ttlcc-bulk-section:last-child{border-bottom:0}
+    .ttlcc-bulk-section-head{
+      display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px
+    }
+    .ttlcc-bulk-section-title{font-size:12px;font-weight:850;color:#e9eef3}
+    .ttlcc-bulk-price-row{
+      display:grid;grid-template-columns:110px 110px 120px 80px auto;
+      gap:8px;align-items:end
+    }
+    .ttlcc-bulk-price-actions{display:flex;gap:6px;align-items:end;flex-wrap:wrap}
+    .ttlcc-bulk-preview-head{
+      display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px
+    }
+    .ttlcc-bulk-preview-actions{display:flex;align-items:center;gap:7px}
+    .ttlcc-bulk-preview .ttlcc-table-wrap{border-radius:8px}
+    .ttlcc-bulk-preview .ttlcc-table th{top:-1px}
+    .ttlcc-bulk-preview .ttlcc-table td{padding-top:8px;padding-bottom:8px}
+    .ttlcc-bulk-preview .ttlcc-table tbody tr{background:transparent}
+    .ttlcc-bulk-preview .ttlcc-table tbody tr:nth-child(even){background:rgba(255,255,255,.012)}
+    .ttlcc-bulk-preview .ttlcc-table tbody tr:hover td{background:rgba(255,255,255,.025)}
+    .ttlcc-bulk-txt-inner{display:grid;grid-template-columns:minmax(260px,360px) minmax(0,1fr);gap:10px;align-items:start}
+    .ttlcc-bulk-txt-inner .ttlcc-textarea{min-height:150px}
+    .ttlcc-bulk-filebox{display:flex;flex-direction:column;gap:8px}
+    .ttlcc-bulk-filebox .ttlcc-file-row{align-items:stretch}
+    .ttlcc-bulk-note{font-size:10px;color:var(--ttlcc-muted)}
+
+    .ttlcc-textarea{
+      width:100%;min-height:200px;resize:vertical;border:1px solid var(--ttlcc-border);background:var(--ttlcc-input);
+      color:var(--ttlcc-text);border-radius:8px;padding:8px;font:11.25px/1.5 Consolas,monospace
+    }
+    .ttlcc-inline-price{display:flex;gap:4px}
+    .ttlcc-inline-price select{width:70px}.ttlcc-inline-price input{width:50px}
+    .ttlcc-price-lock{color:#91b39a;font-weight:750}
+    .ttlcc-state{font-weight:850;font-size:9px}
+    .ttlcc-state.pending{color:#d1ad76}.ttlcc-state.ok{color:#88ad91}.ttlcc-state.bad{color:#d1858a}
+    .ttlcc-advanced{
+      margin-top:9px;border-top:1px solid var(--ttlcc-border-soft);padding-top:7px;color:var(--ttlcc-soft)
+    }
+    .ttlcc-advanced summary{cursor:pointer;font-size:10.5px;font-weight:750;color:var(--ttlcc-muted);user-select:none}
+    .ttlcc-advanced[open] summary{margin-bottom:8px}
+    .ttlcc-check-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:10.5px;color:var(--ttlcc-soft)}
+    .ttlcc-file-row{display:flex;gap:6px;align-items:center}
+    .ttlcc-file-row input[type=file]{flex:1;min-width:0}
+
+    .ttlcc-log{
+      min-height:360px;overflow:visible;background:#090e13;border:1px solid var(--ttlcc-border-soft);
+      border-radius:9px;padding:8px;font:10.5px/1.5 Consolas,monospace
+    }
+    .ttlcc-log-line.ok{color:#8fb69a}.ttlcc-log-line.warn{color:#d0aa74}.ttlcc-log-line.error{color:#d4858a}.ttlcc-log-line.info{color:#99a7b5}
+
+    #ttlcc-modal{position:fixed;z-index:2147483200;inset:0;background:rgba(0,0,0,.68);display:none;align-items:center;justify-content:center;padding:14px}
+    #ttlcc-modal.open{display:flex}
+    .ttlcc-modal-box{
+      width:min(900px,95vw);max-height:90vh;display:flex;flex-direction:column;background:var(--ttlcc-bg);
+      border:1px solid var(--ttlcc-border);border-radius:14px;box-shadow:var(--ttlcc-shadow);overflow:hidden
+    }
+    .ttlcc-modal-head{display:flex;justify-content:space-between;align-items:center;padding:9px 11px;background:var(--ttlcc-surface2);border-bottom:1px solid var(--ttlcc-border);font-weight:850}
+    .ttlcc-modal-body{overflow:auto;padding:11px}
+
+    #ttlcc-toast-host{position:fixed;z-index:2147483300;right:22px;bottom:22px;display:flex;flex-direction:column;gap:7px;pointer-events:none}
+    .ttlcc-toast{max-width:420px;padding:9px 11px;border-radius:9px;background:#25313d;color:#fff;box-shadow:0 10px 28px rgba(0,0,0,.35);opacity:1;transform:translateY(0);transition:.2s}
+    .ttlcc-toast.ok{background:#355344}.ttlcc-toast.warn{background:#665235}.ttlcc-toast.error{background:#6a393e}.ttlcc-toast.out{opacity:0;transform:translateY(8px)}
+
+    .ttlcc-revenue-top{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:10px}
+    .ttlcc-revenue-summary{border:1px solid var(--ttlcc-border-soft);background:var(--ttlcc-surface);border-radius:11px;padding:11px;min-width:0}
+    .ttlcc-revenue-summary-label{font-size:10px;color:var(--ttlcc-muted);font-weight:720}
+    .ttlcc-revenue-summary-value{margin-top:3px;font-size:19px;font-weight:850;color:#f2f5f8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .ttlcc-revenue-summary-sub{margin-top:2px;font-size:10px;color:var(--ttlcc-soft);min-height:14px}
     .ttlcc-revenue-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px}
-    .ttlcc-revenue-meta{font-size:11px;color:var(--ttlcc-muted)}
-    .ttlcc-revenue-story-list{display:flex;flex-direction:column;border:1px solid var(--ttlcc-border);border-radius:10px;overflow:hidden;background:var(--ttlcc-panel)}
-    .ttlcc-revenue-story{display:grid;grid-template-columns:minmax(0,1fr) 80px 90px;gap:7px;align-items:center;padding:7px 9px;border-bottom:1px solid #293543;cursor:default}
+    .ttlcc-revenue-meta{font-size:10.5px;color:var(--ttlcc-muted)}
+    .ttlcc-revenue-story-list{display:flex;flex-direction:column;border:1px solid var(--ttlcc-border-soft);border-radius:10px;overflow:hidden;background:var(--ttlcc-surface)}
+    .ttlcc-revenue-story{display:grid;grid-template-columns:minmax(0,1fr) 80px 90px;gap:7px;align-items:center;padding:8px 9px;border-bottom:1px solid var(--ttlcc-border-soft);cursor:default}
     .ttlcc-revenue-story:last-child{border-bottom:0}
     .ttlcc-revenue-story[data-story-revenue-id]{cursor:pointer}
-    .ttlcc-revenue-story[data-story-revenue-id]:hover{background:#19242e}
-    .ttlcc-revenue-story.selected{background:#1b2b31;box-shadow:inset 3px 0 0 var(--ttlcc-primary)}
+    .ttlcc-revenue-story[data-story-revenue-id]:hover{background:#16212a}
+    .ttlcc-revenue-story.selected{background:var(--ttlcc-primary-soft);box-shadow:inset 3px 0 0 var(--ttlcc-primary)}
     .ttlcc-revenue-story-title{font-weight:750;color:var(--ttlcc-text);min-width:0;overflow:hidden;text-overflow:ellipsis}
-    .ttlcc-current-chip{display:inline-flex;margin-left:6px;padding:2px 6px;border-radius:999px;background:rgba(95,149,161,.16);color:#94c1ca;font-size:9px;vertical-align:1px}
+    .ttlcc-current-chip{display:inline-flex;margin-left:6px;padding:2px 6px;border-radius:999px;background:var(--ttlcc-primary-soft);color:#9bc5cf;font-size:9px;vertical-align:1px}
     .ttlcc-revenue-story-sales,.ttlcc-revenue-story-kc{text-align:right;font-weight:800}
     .ttlcc-revenue-story-sales span,.ttlcc-revenue-story-kc span{display:block;font-size:9px;color:var(--ttlcc-muted);font-weight:600}
     .ttlcc-revenue-story-kc{color:#9fc9d2}
-    @media(max-width:900px){#ttlcc-panel{top:7px;right:7px;width:calc(100vw - 14px);height:calc(100vh - 14px);max-height:calc(100vh - 14px)}#ttlcc-panel.ttlcc-minimized{top:auto;right:70px;bottom:12px;width:62px;height:34px;max-height:34px}.ttlcc-grid2,.ttlcc-bulk-layout{grid-template-columns:1fr}.ttlcc-story-list{max-height:240px}.ttlcc-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.ttlcc-revenue-top{grid-template-columns:1fr}.ttlcc-choice-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.ttlcc-live-form{grid-template-columns:1fr}.ttlcc-field-wide{grid-column:1}.ttlcc-grid3{grid-template-columns:1fr}}
-    @media(max-width:560px){.ttlcc-revenue-story{grid-template-columns:minmax(0,1fr) 70px 78px;padding:9px}.ttlcc-revenue-summary-value{font-size:18px}}
+
+    @media(max-width:900px){
+      #ttlcc-panel{top:7px;right:7px;width:calc(100vw - 14px);height:calc(100vh - 14px);max-height:calc(100vh - 14px)}
+      .ttlcc-grid2{grid-template-columns:1fr}
+      .ttlcc-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .ttlcc-revenue-top{grid-template-columns:1fr}.ttlcc-choice-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .ttlcc-live-form{grid-template-columns:1fr}.ttlcc-field-wide{grid-column:1}.ttlcc-grid3{grid-template-columns:1fr}
+      .ttlcc-overview-hero{align-items:flex-start;flex-direction:column}.ttlcc-quick-actions{justify-content:flex-start}
+      .ttlcc-bulk-command{grid-template-columns:1fr 1fr}
+      .ttlcc-bulk-command > .ttlcc-field:first-child{grid-column:1/-1}
+      .ttlcc-bulk-command .ttlcc-advanced{grid-column:1/-1;justify-self:start}
+      .ttlcc-bulk-price-row{grid-template-columns:1fr 1fr}
+      .ttlcc-bulk-price-actions{grid-column:1/-1}
+      .ttlcc-bulk-txt-inner{grid-template-columns:1fr}
+    }
+    @media(max-width:560px){
+      .ttlcc-context{align-items:flex-start;flex-direction:column}.ttlcc-status{max-width:100%;width:100%}
+      .ttlcc-revenue-story{grid-template-columns:minmax(0,1fr) 70px 78px;padding:9px}
+      .ttlcc-revenue-summary-value{font-size:18px}.ttlcc-stats{grid-template-columns:1fr 1fr}
+    }
+
   `;
 
   function injectUi() {
@@ -3269,75 +4608,84 @@
     panel.id = 'ttlcc-panel';
     panel.innerHTML = `
       <div class="ttlcc-head" id="ttlcc-head">
-        <div class="ttlcc-head-main">
-          <div class="ttlcc-head-title">Trích Tinh Lâu · Control Center</div>
-          <div class="ttlcc-head-sub">v${VERSION} · form/route live-adapter · không hardcode vị trí cột</div>
+        <div class="ttlcc-brand">
+          <span class="ttlcc-brand-name">TTL Control</span>
+          <span class="ttlcc-brand-ver">v${VERSION}</span>
         </div>
         <div class="ttlcc-head-actions">
-          <span class="ttlcc-badge" id="ttlcc-story-badge">—</span>
-          <button class="ttlcc-icon" id="ttlcc-refresh-all" type="button" title="Refresh">↻</button>
-          <button class="ttlcc-icon" id="ttlcc-minimize" type="button" title="Thu gọn">−</button>
+          <span class="ttlcc-story-badge" id="ttlcc-story-badge">—</span>
+          <button class="ttlcc-icon" id="ttlcc-open-log" type="button" title="Nhật ký" aria-label="Nhật ký">≡</button>
+          <button class="ttlcc-icon" id="ttlcc-refresh-all" type="button" title="Làm mới" aria-label="Làm mới">↻</button>
+          <button class="ttlcc-icon" id="ttlcc-minimize" type="button" title="Thu gọn" aria-label="Thu gọn">−</button>
         </div>
       </div>
 
-      <div class="ttlcc-selection">
+      <div class="ttlcc-context">
         <div class="ttlcc-selection-main">
           <div class="ttlcc-selected-title" id="ttlcc-selected-title">Chưa chọn truyện</div>
-          <div class="ttlcc-selected-sub" id="ttlcc-selected-sub">Đang khởi tạo…</div>
+          <div class="ttlcc-selected-sub" id="ttlcc-selected-sub"></div>
         </div>
-        <div id="ttlcc-status" class="ttlcc-status">Đang khởi tạo…</div>
+        <div id="ttlcc-status" class="ttlcc-status" aria-live="polite">Đang khởi tạo…</div>
       </div>
 
       <div class="ttlcc-tabs">
-        <button class="ttlcc-tab-btn active" data-tab="dashboard" type="button">Tổng quan</button>
-        <button class="ttlcc-tab-btn" data-tab="stories" type="button">Truyện</button>
+        <button class="ttlcc-tab-btn active" data-tab="stories" type="button">Danh sách</button>
+        <button class="ttlcc-tab-btn" data-tab="dashboard" type="button">Tổng quan</button>
         <button class="ttlcc-tab-btn" data-tab="chapters" type="button">Chương</button>
-        <button class="ttlcc-tab-btn" data-tab="bulk" type="button">Bulk</button>
+        <button class="ttlcc-tab-btn" data-tab="bulk" type="button">Hàng loạt</button>
         <button class="ttlcc-tab-btn" data-tab="revenue" type="button">Doanh thu</button>
-        <button class="ttlcc-tab-btn" data-tab="log" type="button">Log</button>
       </div>
 
       <div class="ttlcc-main">
-        <section class="ttlcc-pane active" data-pane="dashboard">
+        <section class="ttlcc-pane" data-pane="dashboard">
+          <div class="ttlcc-overview-hero">
+            <div class="ttlcc-overview-story">
+              <div class="ttlcc-overview-kicker">Truyện đang chọn</div>
+              <div class="ttlcc-overview-title" id="ttlcc-stat-story">—</div>
+            </div>
+            <div class="ttlcc-quick-actions">
+              <button class="ttlcc-btn ttlcc-btn-soft" type="button" data-jump-tab="chapters">Chương</button>
+              <button class="ttlcc-btn ttlcc-btn-primary" type="button" data-jump-tab="bulk">Hàng loạt</button>
+              <button class="ttlcc-btn ttlcc-btn-soft" type="button" data-jump-tab="revenue">Doanh thu</button>
+            </div>
+          </div>
+
           <div class="ttlcc-stats">
-            <div class="ttlcc-stat"><div class="ttlcc-stat-label">Truyện đang chọn</div><div class="ttlcc-stat-value" id="ttlcc-stat-story">—</div></div>
             <div class="ttlcc-stat"><div class="ttlcc-stat-label">Tổng chương</div><div class="ttlcc-stat-value" id="ttlcc-stat-chapters">0</div></div>
             <div class="ttlcc-stat"><div class="ttlcc-stat-label">Miễn phí</div><div class="ttlcc-stat-value" id="ttlcc-stat-free">0</div></div>
             <div class="ttlcc-stat"><div class="ttlcc-stat-label">Trả Sao</div><div class="ttlcc-stat-value" id="ttlcc-stat-stars">0</div></div>
             <div class="ttlcc-stat"><div class="ttlcc-stat-label">Trả KC</div><div class="ttlcc-stat-value" id="ttlcc-stat-diamonds">0</div></div>
           </div>
-          <div id="ttlcc-dashboard-warning" class="ttlcc-warning" style="display:none"></div>
-          <div class="ttlcc-card" style="margin-top:12px">
-            <div class="ttlcc-card-title">
-              <span>Kiểm tra nhanh</span>
-              <span class="ttlcc-badge">Short-paid: <span id="ttlcc-stat-shortpaid">0</span></span>
-            </div>
-            <div class="ttlcc-head-sub" style="color:var(--ttlcc-muted)">
-              Dashboard chỉ hiển thị trạng thái. Thao tác thật nằm đúng một nơi ở tab Truyện, Chương, Bulk hoặc Doanh thu.
-            </div>
+
+          <div id="ttlcc-dashboard-warning" class="ttlcc-warning" style="display:none">
+            <span id="ttlcc-dashboard-warning-text"></span>
+            <button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" id="ttlcc-dashboard-fix-short" type="button">Sửa giá</button>
           </div>
+
+          <span id="ttlcc-stat-shortpaid" hidden>0</span>
         </section>
 
-        <section class="ttlcc-pane" data-pane="stories">
+        <section class="ttlcc-pane active" data-pane="stories">
           <div class="ttlcc-grid2">
             <div class="ttlcc-card">
-              <div class="ttlcc-card-title"><span>Danh sách truyện</span></div>
+              <div class="ttlcc-card-title">Danh sách truyện</div>
               <div class="ttlcc-toolbar">
-                <input class="ttlcc-input" id="ttlcc-story-filter" type="text" placeholder="Lọc tên / ID…" style="flex:1;min-width:120px">
-                <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-story-server-search" type="button">Tìm server</button>
-                <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-story-reload" type="button">↻</button>
+                <input class="ttlcc-input" id="ttlcc-story-filter" type="text" placeholder="Tên hoặc ID" style="flex:1;min-width:120px">
+                <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-story-server-search" type="button">Tìm</button>
+                <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-story-reload" type="button" title="Làm mới">↻</button>
               </div>
-              <div class="ttlcc-story-list" id="ttlcc-story-list" style="margin-top:8px"></div>
+              <div class="ttlcc-story-list" id="ttlcc-story-list" style="margin-top:9px"></div>
             </div>
+
             <div class="ttlcc-card">
               <div class="ttlcc-card-title">
-                <span>Thông tin truyện</span>
+                <span>Chi tiết</span>
                 <div class="ttlcc-toolbar">
-                  <button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" id="ttlcc-edit-story" type="button">Nạp form sửa</button>
-                  <button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" id="ttlcc-publish-story" type="button">Publish / Tạm ẩn</button>
+                  <button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-primary" id="ttlcc-edit-story" type="button">Sửa truyện</button>
+                  <button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" id="ttlcc-publish-story" type="button">Hiện / Ẩn</button>
                 </div>
               </div>
-              <div id="ttlcc-story-editor" class="ttlcc-empty">Chọn truyện rồi bấm “Nạp form sửa”.</div>
+              <div id="ttlcc-story-editor" class="ttlcc-empty">Chọn truyện để chỉnh sửa.</div>
             </div>
           </div>
         </section>
@@ -3345,21 +4693,21 @@
         <section class="ttlcc-pane" data-pane="chapters">
           <div class="ttlcc-card">
             <div class="ttlcc-card-title">
-              <span>Danh sách chương</span>
+              <span>Chương</span>
               <div class="ttlcc-toolbar">
-                <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-create-chapter" type="button">+ Chương mới</button>
-                <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-chapter-reload" type="button">Quét server</button>
+                <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-create-chapter" type="button">+ Thêm chương</button>
+                <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-chapter-reload" type="button" title="Làm mới">↻</button>
               </div>
             </div>
             <div class="ttlcc-toolbar">
-              <input class="ttlcc-input" id="ttlcc-chapter-filter" type="text" placeholder="Tên / slug / số chương…" style="min-width:230px">
-              <label><input id="ttlcc-chapter-paid" type="checkbox"> Chỉ trả phí</label>
-              <label><input id="ttlcc-chapter-short" type="checkbox"> Chỉ &lt;1000 từ</label>
+              <input class="ttlcc-input" id="ttlcc-chapter-filter" type="text" placeholder="Tìm chương…" style="min-width:230px;flex:1">
+              <label class="ttlcc-check-row"><span><input id="ttlcc-chapter-paid" type="checkbox"> Trả phí</span></label>
+              <label class="ttlcc-check-row"><span><input id="ttlcc-chapter-short" type="checkbox"> Dưới 1000 từ</span></label>
             </div>
-            <div class="ttlcc-table-wrap" style="margin-top:9px">
+            <div class="ttlcc-table-wrap" style="margin-top:10px">
               <table class="ttlcc-table">
-                <thead><tr><th>#</th><th>Tên chương</th><th>Trạng thái</th><th>Slug</th><th>Số từ</th><th>Pass</th><th>Mở khóa</th><th>Thao tác</th></tr></thead>
-                <tbody id="ttlcc-chapter-body"><tr><td colspan="8" class="ttlcc-empty">Chưa tải chương.</td></tr></tbody>
+                <thead><tr><th>#</th><th>Chương</th><th>Từ</th><th>Giá</th><th style="text-align:right">Thao tác</th></tr></thead>
+                <tbody id="ttlcc-chapter-body"><tr><td colspan="5" class="ttlcc-empty">Chưa tải chương.</td></tr></tbody>
               </table>
             </div>
           </div>
@@ -3367,65 +4715,109 @@
 
         <section class="ttlcc-pane" data-pane="bulk">
           <div class="ttlcc-bulk-layout">
-            <div>
-              <div class="ttlcc-card">
-                <div class="ttlcc-card-title">Bulk engine</div>
+            <div class="ttlcc-bulk-command">
+              <div class="ttlcc-field">
+                <div class="ttlcc-label">Tác vụ</div>
+                <select id="ttlcc-bulk-operation" aria-label="Tác vụ hàng loạt">
+                  <option value="price_update">Cập nhật giá</option>
+                  <option value="content">Cập nhật nội dung</option>
+                  <option value="both">Cập nhật tên + nội dung</option>
+                  <option value="title">Đổi tên chương</option>
+                  <option value="create">Đăng chương mới</option>
+                </select>
+              </div>
+
+              <div class="ttlcc-field">
+                <div class="ttlcc-label">Từ chương</div>
+                <input id="ttlcc-bulk-from" type="number" min="1">
+              </div>
+
+              <div class="ttlcc-field">
+                <div class="ttlcc-label">Đến chương</div>
+                <input id="ttlcc-bulk-to" type="number" min="1">
+              </div>
+
+              <details class="ttlcc-advanced">
+                <summary>Tùy chọn</summary>
+                <div class="ttlcc-toolbar">
+                  <div class="ttlcc-field" style="width:150px">
+                    <div class="ttlcc-label">Khoảng nghỉ (ms)</div>
+                    <input id="ttlcc-bulk-delay" type="number" min="0" step="100" value="1100">
+                  </div>
+                  <label class="ttlcc-check-row"><input id="ttlcc-bulk-verify" type="checkbox" checked> Xác minh sau lưu</label>
+                  <label class="ttlcc-check-row"><input id="ttlcc-bulk-stop-error" type="checkbox" checked> Dừng khi lỗi</label>
+                </div>
+              </details>
+            </div>
+
+            <div class="ttlcc-bulk-section" id="ttlcc-bulk-txt-card" style="display:none">
+              <div class="ttlcc-bulk-section-head">
+                <div class="ttlcc-bulk-section-title">Dữ liệu TXT</div>
+              </div>
+              <div class="ttlcc-bulk-txt-inner">
+                <div class="ttlcc-bulk-filebox">
+                  <div class="ttlcc-file-row">
+                    <input id="ttlcc-bulk-file" type="file" accept=".txt,text/plain" multiple>
+                    <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-bulk-parse" type="button">Đọc dữ liệu</button>
+                  </div>
+                  <div class="ttlcc-bulk-note">Có thể chọn nhiều TXT cùng lúc hoặc dán trực tiếp nội dung.</div>
+                </div>
+                <textarea id="ttlcc-bulk-text" class="ttlcc-textarea" placeholder="CHƯƠNG 96: Tên chương&#10;&#10;Nội dung…"></textarea>
+              </div>
+            </div>
+
+            <div class="ttlcc-bulk-section" id="ttlcc-price-card">
+              <div class="ttlcc-bulk-section-head">
+                <div class="ttlcc-bulk-section-title">Giá mở khóa</div>
+              </div>
+              <div class="ttlcc-bulk-price-row">
                 <div class="ttlcc-field">
-                  <div class="ttlcc-label">Tác vụ</div>
-                  <select id="ttlcc-bulk-operation">
-                    <option value="price_update">Fix giá CHƯƠNG cũ</option>
-                    <option value="both">Cập nhật tên + nội dung</option>
-                    <option value="title">Chỉ đổi tên</option>
-                    <option value="content">Chỉ cập nhật nội dung</option>
-                    <option value="create">Đăng CHƯƠNG mới</option>
+                  <div class="ttlcc-label">Từ</div>
+                  <input id="ttlcc-price-from" type="number" min="1">
+                </div>
+                <div class="ttlcc-field">
+                  <div class="ttlcc-label">Đến</div>
+                  <input id="ttlcc-price-to" type="number" min="1">
+                </div>
+                <div class="ttlcc-field">
+                  <div class="ttlcc-label">Loại</div>
+                  <select id="ttlcc-price-type">
+                    <option value="free">FREE</option>
+                    <option value="stars">Sao</option>
+                    <option value="diamond">KC</option>
                   </select>
                 </div>
-                <div class="ttlcc-grid3" style="margin-top:8px">
-                  <div class="ttlcc-field"><div class="ttlcc-label">Từ chương</div><input id="ttlcc-bulk-from" type="number" min="1"></div>
-                  <div class="ttlcc-field"><div class="ttlcc-label">Đến chương</div><input id="ttlcc-bulk-to" type="number" min="1"></div>
-                  <div class="ttlcc-field"><div class="ttlcc-label">Delay ms</div><input id="ttlcc-bulk-delay" type="number" min="0" step="100" value="1100"></div>
+                <div class="ttlcc-field">
+                  <div class="ttlcc-label">Giá</div>
+                  <input id="ttlcc-price-value" type="number" min="1" max="10" value="5">
                 </div>
-                <div class="ttlcc-toolbar" style="margin-top:8px">
-                  <label><input id="ttlcc-bulk-verify" type="checkbox" checked> Re-check sau lưu</label>
-                  <label><input id="ttlcc-bulk-stop-error" type="checkbox" checked> Dừng khi lỗi</label>
-                </div>
-              </div>
-
-              <div class="ttlcc-card" id="ttlcc-bulk-txt-card" style="display:none">
-                <div class="ttlcc-card-title"><span>TXT · nhiều file</span><span class="ttlcc-badge">CHƯƠNG X: Tên</span></div>
-                <input id="ttlcc-bulk-file" type="file" accept=".txt,text/plain" multiple>
-                <textarea id="ttlcc-bulk-text" class="ttlcc-textarea" placeholder="CHƯƠNG 96: Tên chương\n\nNội dung…"></textarea>
-                <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-bulk-parse" type="button" style="margin-top:8px">Phân tích TXT</button>
-              </div>
-
-              <div class="ttlcc-card" id="ttlcc-price-card">
-                <div class="ttlcc-card-title">Giá mở khóa</div>
-                <div class="ttlcc-grid3">
-                  <div class="ttlcc-field"><div class="ttlcc-label">Từ</div><input id="ttlcc-price-from" type="number" min="1"></div>
-                  <div class="ttlcc-field"><div class="ttlcc-label">Đến</div><input id="ttlcc-price-to" type="number" min="1"></div>
-                  <div class="ttlcc-field"><div class="ttlcc-label">Loại</div><select id="ttlcc-price-type"><option value="free">FREE</option><option value="stars">Sao</option><option value="diamond">KC</option></select></div>
-                </div>
-                <div class="ttlcc-toolbar" style="margin-top:8px">
-                  <input id="ttlcc-price-value" type="number" min="1" max="10" value="5" style="width:75px">
+                <div class="ttlcc-bulk-price-actions">
                   <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-price-apply" type="button">Áp dụng</button>
                   <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-price-alt-star" type="button">Sao → KC</button>
                   <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-price-alt-kc" type="button">KC → Sao</button>
                 </div>
-                <div class="ttlcc-head-sub" style="margin-top:8px;color:var(--ttlcc-muted)">Dưới 1000 từ bị ép FREE. Sao 1–10. KC cố định 1.</div>
               </div>
             </div>
 
-            <div class="ttlcc-card">
-              <div class="ttlcc-card-title"><span>Preview / Re-check</span><span id="ttlcc-bulk-summary" class="ttlcc-badge">Chưa có dữ liệu</span></div>
-              <div class="ttlcc-table-wrap" style="max-height:430px">
+            <div class="ttlcc-bulk-section ttlcc-bulk-preview">
+              <div class="ttlcc-bulk-preview-head">
+                <div class="ttlcc-toolbar">
+                  <div class="ttlcc-bulk-section-title">Kiểm tra</div>
+                  <span id="ttlcc-bulk-summary" class="ttlcc-story-badge">Chưa có dữ liệu</span>
+                </div>
+                <div class="ttlcc-bulk-preview-actions">
+                  <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-bulk-cancel" type="button" disabled>Dừng</button>
+                  <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-bulk-run" type="button">Chạy</button>
+                </div>
+              </div>
+
+              <div class="ttlcc-table-wrap">
                 <table class="ttlcc-table">
-                  <thead><tr><th>Ch.</th><th>Tên</th><th>Số từ</th><th>Giá</th><th>Trạng thái</th></tr></thead>
+                  <thead>
+                    <tr><th>Ch.</th><th>Tên</th><th>Từ</th><th>Giá</th><th>Trạng thái</th></tr>
+                  </thead>
                   <tbody id="ttlcc-bulk-preview"></tbody>
                 </table>
-              </div>
-              <div class="ttlcc-toolbar" style="margin-top:10px;justify-content:flex-end">
-                <button class="ttlcc-btn ttlcc-btn-danger" id="ttlcc-bulk-cancel" type="button" disabled>Hủy</button>
-                <button class="ttlcc-btn ttlcc-btn-primary" id="ttlcc-bulk-run" type="button">Chạy batch</button>
               </div>
             </div>
           </div>
@@ -3438,13 +4830,11 @@
               <div class="ttlcc-revenue-summary-value" id="ttlcc-revenue-withdrawable">—</div>
               <div class="ttlcc-revenue-summary-sub" id="ttlcc-revenue-withdrawable-sub">Số dư khả dụng: —</div>
             </div>
-
             <div class="ttlcc-revenue-summary">
               <div class="ttlcc-revenue-summary-label">Tổng KC đã thu</div>
               <div class="ttlcc-revenue-summary-value" id="ttlcc-revenue-total">—</div>
               <div class="ttlcc-revenue-summary-sub" id="ttlcc-revenue-total-sub">— lượt bán</div>
             </div>
-
             <div class="ttlcc-revenue-summary">
               <div class="ttlcc-revenue-summary-label">Tháng này</div>
               <div class="ttlcc-revenue-summary-value" id="ttlcc-revenue-month">—</div>
@@ -3455,12 +4845,11 @@
           <div class="ttlcc-card">
             <div class="ttlcc-revenue-toolbar">
               <div>
-                <div class="ttlcc-card-title" style="margin:0">Doanh thu theo truyện</div>
+                <div class="ttlcc-card-title" style="margin:0">Theo truyện</div>
                 <div class="ttlcc-revenue-meta" id="ttlcc-revenue-meta"></div>
               </div>
-              <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-revenue-refresh" type="button">↻ Refresh</button>
+              <button class="ttlcc-btn ttlcc-btn-soft" id="ttlcc-revenue-refresh" type="button">↻ Làm mới</button>
             </div>
-
             <div class="ttlcc-revenue-story-list" id="ttlcc-revenue-stories">
               <div class="ttlcc-empty">Mở tab để tải doanh thu.</div>
             </div>
@@ -3468,12 +4857,16 @@
         </section>
 
         <section class="ttlcc-pane" data-pane="log">
-          <div class="ttlcc-card">
-            <div class="ttlcc-card-title"><span>Nhật ký</span><button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" id="ttlcc-log-clear" type="button">Xóa log</button></div>
+          <div class="ttlcc-card" style="margin-bottom:0">
+            <div class="ttlcc-card-title">
+              <span>Nhật ký</span>
+              <button class="ttlcc-btn ttlcc-btn-mini ttlcc-btn-soft" id="ttlcc-log-clear" type="button">Xóa</button>
+            </div>
             <div id="ttlcc-log" class="ttlcc-log"></div>
           </div>
         </section>
       </div>
+
     `;
     document.body.appendChild(panel);
 
@@ -3494,7 +4887,10 @@
 
     const prefs = loadPrefs();
     if (prefs.minimized) panel.classList.add('ttlcc-minimized');
-    if (prefs.activeTab) switchTab(prefs.activeTab);
+
+    // Luôn bắt đầu ở tab đầu tiên để người dùng xác nhận context truyện trước.
+    // Không phục hồi tab cũ từ phiên trước.
+    switchTab('stories');
   }
 
   function switchTab(tab) {
@@ -3521,6 +4917,17 @@
     if (txt) txt.style.display = op === 'price_update' ? 'none' : '';
     if (price) price.style.display = ['price_update', 'create'].includes(op) ? '' : 'none';
 
+    const runBtn = $('#ttlcc-bulk-run');
+    if (runBtn) {
+      runBtn.textContent = ({
+        price_update: 'Cập nhật giá',
+        content: 'Cập nhật nội dung',
+        both: 'Cập nhật',
+        title: 'Đổi tên',
+        create: 'Đăng chương',
+      })[op] || 'Chạy';
+    }
+
     if (op === 'price_update') {
       // Chuyển vào Fix giá => lấy server hiện tại làm baseline mới.
       initializeExistingPricing(true);
@@ -3545,6 +4952,21 @@
 
   function bindUiEvents() {
     $$('.ttlcc-tab-btn').forEach(btn => btn.onclick = () => switchTab(btn.dataset.tab));
+    $$('[data-jump-tab]').forEach(btn => {
+      btn.onclick = () => switchTab(btn.dataset.jumpTab);
+    });
+
+    $('#ttlcc-open-log').onclick = e => {
+      e.preventDefault();
+      e.stopPropagation();
+      switchTab('log');
+    };
+
+    $('#ttlcc-dashboard-fix-short').onclick = () => {
+      switchTab('bulk');
+      $('#ttlcc-bulk-operation').value = 'price_update';
+      syncBulkOperationUi();
+    };
 
     $('#ttlcc-minimize').onclick = e => {
       // Quan trọng: chặn click bubble lên header, nếu không header sẽ
@@ -3567,6 +4989,7 @@
     });
 
     $('#ttlcc-refresh-all').onclick = async () => {
+      if (state.running) return toast('Batch đang chạy. Chờ hoàn tất trước khi làm mới.', 'warn');
       try {
         await loadStories();
         if (state.selectedStoryId) await loadChapters();
@@ -3577,8 +5000,12 @@
     };
 
     $('#ttlcc-story-filter').addEventListener('input', renderStoryList);
-    $('#ttlcc-story-reload').onclick = () => loadStories().catch(err => toast(err.message, 'error'));
+    $('#ttlcc-story-reload').onclick = () => {
+      if (state.running) return toast('Batch đang chạy.', 'warn');
+      loadStories().catch(err => toast(err.message, 'error'));
+    };
     $('#ttlcc-story-server-search').onclick = () => {
+      if (state.running) return toast('Batch đang chạy.', 'warn');
       const q = $('#ttlcc-story-filter').value.trim();
       if (!q) return loadStories();
       loadStories({ serverSearch: true, query: q }).catch(err => toast(`Tìm server lỗi: ${err.message}`, 'error'));
@@ -3590,7 +5017,10 @@
     $('#ttlcc-chapter-paid').addEventListener('change', renderChapters);
     $('#ttlcc-chapter-short').addEventListener('change', renderChapters);
     $('#ttlcc-create-chapter').onclick = openCreateChapter;
-    $('#ttlcc-chapter-reload').onclick = () => loadChapters().catch(err => toast(err.message, 'error'));
+    $('#ttlcc-chapter-reload').onclick = () => {
+      if (state.running) return toast('Batch đang chạy.', 'warn');
+      loadChapters().catch(err => toast(err.message, 'error'));
+    };
 
     $('#ttlcc-bulk-operation').onchange = syncBulkOperationUi;
     $('#ttlcc-bulk-from').oninput = () => {
@@ -3639,7 +5069,7 @@
     $('#ttlcc-bulk-run').onclick = () => runBulk().catch(err => toast(err.message, 'error'));
     $('#ttlcc-bulk-cancel').onclick = () => {
       state.cancelled = true;
-      toast('Đã nhận lệnh hủy; batch sẽ dừng trước request kế tiếp.', 'warn');
+      toast('Đã yêu cầu dừng. Tác vụ đang xử lý sẽ hoàn tất an toàn trước khi dừng.', 'warn');
     };
 
     $('#ttlcc-revenue-refresh').onclick = () =>
