@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trích Tinh Lâu - Control Center Toàn Diện
 // @namespace    https://github.com/caccac11/TTL
-// @version      1.4.3
+// @version      1.4.4
 // @description  TTL Control: giao diện phẳng một trục cuộn, bulk native an toàn, update pipeline no-follow, quản lý truyện/chương/doanh thu.
 // @match        https://trichtinhlau.com/*
 // @homepageURL  https://github.com/caccac11/TTL
@@ -24,7 +24,7 @@
   if (window.__TTL_CONTROL_CENTER__) return;
   window.__TTL_CONTROL_CENTER__ = true;
 
-  const VERSION = '1.4.3';
+  const VERSION = '1.4.4';
   const ORIGIN = location.origin;
   const STORE_KEY = 'ttl-control-center-v1';
 
@@ -78,6 +78,8 @@
     running: false,
     cancelled: false,
     snapshotCache: new Map(),
+    bulkLoadSeq: 0,
+    bulkLoading: false,
     bulk: {
       parsed: [],
       pricing: new Map(),
@@ -857,17 +859,31 @@
   }
 
   async function hydrateStoryTitles(map) {
-    const unknown = [...map.values()].filter(s => !s.title || s.title.startsWith('Truyện #'));
-    for (let i = 0; i < Math.min(unknown.length, 8); i++) {
-      const s = unknown[i];
-      try {
-        const { doc } = await fetchDoc(s.editUrl, `Đọc tên truyện #${s.id}`);
-        const f = [...doc.forms].find(x => x.querySelector('[name="tentruyen"]'));
-        const title = f?.querySelector('[name="tentruyen"]')?.value;
-        if (title) s.title = text(title);
-      } catch {}
-      if (i + 1 < unknown.length) await sleep(200);
-    }
+    const unknown = [...map.values()]
+      .filter(s => !s.title || s.title.startsWith('Truyện #'))
+      .slice(0, 8);
+    if (!unknown.length) return;
+
+    // Tối đa 2 GET song song, cách điểm khởi chạy 400ms. Đảm bảo vẫn
+    // đọc đúng tối đa 8 form gốc và chỉ sửa metadata local của từng truyện.
+    await runSmoothUpdatePhase({
+      name: 'Metadata truyện',
+      entries: unknown,
+      concurrency: 2,
+      startGapMs: 400,
+      respectCancel: false,
+      stopOnTaskError: false,
+      task: async s => {
+        try {
+          const { doc } = await fetchDoc(s.editUrl, `Đọc tên truyện #${s.id}`);
+          const f = [...doc.forms].find(x => x.querySelector('[name="tentruyen"]'));
+          const title = f?.querySelector('[name="tentruyen"]')?.value;
+          if (title) s.title = text(title);
+        } catch (err) {
+          addLog(`Không lấy được tên truyện #${s.id}: ${err.message}`, 'warn');
+        }
+      },
+    });
   }
 
   function mergeStories(next) {
@@ -980,6 +996,9 @@
   }
 
   function resetBulkForStoryChange() {
+    // Hủy hiệu lực các lần đọc TXT đang chạy ở ngữ cảnh truyện trước.
+    state.bulkLoadSeq++;
+    state.bulkLoading = false;
     state.bulk.parsed = [];
     state.bulk.pricing.clear();
     state.bulk.existingPricing.clear();
@@ -1655,6 +1674,7 @@
         title: sanitizeChapterTitle(h.titleRaw, h.chapterNo),
         rawContent,
         htmlContent: plainTextToHtml(rawContent),
+        // wordCount tính lazy bằng countWordsFromHtml() khi cần áp giá/preview.
       };
     });
 
@@ -1683,17 +1703,22 @@
     $('#ttlcc-price-from').value = first;
     $('#ttlcc-price-to').value = last;
 
-    for (const item of rows) getPricing(item.chapterNo);
-
+    // Không chạy kiểm tra giá cho toàn batch khi chỉ cập nhật title/content.
+    // Target giá của CREATE được khởi tạo lazy khi preview/chọn giá/chạy.
     renderBulkPreview();
 
     if (message) toast(message, 'ok');
   }
 
   async function loadBulkTxtFiles(fileList) {
+    if (state.running) throw new Error('Batch đang chạy; không nạp TXT mới.');
+    const storyIdAtStart = Number(state.selectedStoryId || 0);
     const files = [...(fileList || [])];
     if (!files.length) return;
+    const loadSeq = ++state.bulkLoadSeq;
+    state.bulkLoading = true;
 
+    try {
     const invalid = files.filter(file => {
       const name = String(file?.name || '');
       return !/\.txt$/i.test(name) && file?.type && file.type !== 'text/plain';
@@ -1774,6 +1799,12 @@
       .flatMap(batch => batch.parsed)
       .sort((a, b) => a.chapterNo - b.chapterNo);
 
+    if (state.running ||
+        loadSeq !== state.bulkLoadSeq ||
+        storyIdAtStart !== Number(state.selectedStoryId || 0)) {
+      throw new Error('Ngữ cảnh truyện/batch đã thay đổi khi đang đọc TXT. Không áp dụng dữ liệu cũ.');
+    }
+
     // Textarea chỉ để user xem/chỉnh tay.
     // State parsed đã lấy trực tiếp từ từng file nên không bị lỗi ranh giới file.
     $('#ttlcc-bulk-text').value = batches
@@ -1795,6 +1826,9 @@
       (first != null ? ` (${first}–${last})` : '') +
       '.'
     );
+    } finally {
+      if (loadSeq === state.bulkLoadSeq) state.bulkLoading = false;
+    }
   }
 
   function countWordsFromHtml(html) {
@@ -1838,10 +1872,34 @@
     return $('#ttlcc-bulk-operation')?.value || state.bulk.operation || 'price_update';
   }
 
+  // Chỉ dựng lại index khi mảng parsed được thay (nạp file/parse/đổi truyện).
+  // Tránh tìm tuyến tính và parse lại HTML trên từng ô giá/preview.
+  let parsedIndexSource = null;
+  let parsedIndex = new Map();
+
+  function parsedChapter(no) {
+    if (parsedIndexSource !== state.bulk.parsed) {
+      parsedIndexSource = state.bulk.parsed;
+      parsedIndex = new Map(state.bulk.parsed.map(x => [Number(x.chapterNo), x]));
+    }
+    return parsedIndex.get(Number(no));
+  }
+
   function bulkItemWordCount(no) {
-    const parsed = state.bulk.parsed.find(x => x.chapterNo === Number(no));
-    if (parsed) return countWordsFromHtml(parsed.htmlContent);
-    return Number(state.chapterMap.get(Number(no))?.wordCount || 0);
+    no = Number(no);
+    // FIX GIÁ CHƯƠNG CŨ phải dùng số từ trên server, không được lấy dữ liệu
+    // TXT của lần nạp trước (TXT thuộc nhánh CREATE/UPDATE khác).
+    if (bulkOperation() === 'price_update') {
+      return Number(state.chapterMap.get(no)?.wordCount || 0);
+    }
+    const parsed = parsedChapter(no);
+    if (parsed) {
+      if (!Number.isFinite(parsed.wordCount)) {
+        parsed.wordCount = countWordsFromHtml(parsed.htmlContent);
+      }
+      return parsed.wordCount;
+    }
+    return Number(state.chapterMap.get(no)?.wordCount || 0);
   }
 
   function pricingLocked(no) {
@@ -1921,6 +1979,7 @@
   }
 
   function applyPricingRange() {
+    if (state.running) return toast('Batch đang chạy, không thể sửa target giá.', 'warn');
     const from = Number($('#ttlcc-price-from').value);
     const to = Number($('#ttlcc-price-to').value);
     const type = $('#ttlcc-price-type').value;
@@ -1942,6 +2001,7 @@
   }
 
   function applyAlternating(first = 'stars') {
+    if (state.running) return toast('Batch đang chạy, không thể sửa target giá.', 'warn');
     const from = Number($('#ttlcc-price-from').value || $('#ttlcc-bulk-from').value);
     const to = Number($('#ttlcc-price-to').value || $('#ttlcc-bulk-to').value);
     const star = clamp(Number($('#ttlcc-price-value').value || 5), 1, CFG.pricing.maxStars);
@@ -1967,18 +2027,24 @@
     const op = bulkOperation();
     const items = selectedBulkItems();
     const maxExisting = state.chapters.length ? Math.max(...state.chapters.map(x => x.chapterNo)) : 0;
-    let changed = 0;
+    // Summary đếm trên TOÀN BỘ dải, không chỉ 250 dòng được render.
+    const changed = op === 'price_update'
+      ? items.filter(x => {
+          const row = state.chapterMap.get(x.chapterNo);
+          return row && !priceMatchesRow(getPricing(x.chapterNo), row);
+        }).length
+      : 0;
 
     const frag = document.createDocumentFragment();
 
     for (const item of items.slice(0, CFG.maxPreviewRows)) {
       const row = state.chapterMap.get(item.chapterNo);
-      const p = getPricing(item.chapterNo);
+      const canPrice = ['price_update', 'create'].includes(op);
+      const p = canPrice ? getPricing(item.chapterNo) : null;
       let status = '';
 
       if (op === 'price_update') {
         const diff = row && !priceMatchesRow(p, row);
-        if (diff) changed++;
         status = !row ? 'KHÔNG THẤY' : diff ? 'SẼ SỬA GIÁ' : 'KHÔNG ĐỔI';
       } else if (op === 'create') {
         status = row || item.chapterNo <= maxExisting ? 'ĐÃ TỒN TẠI' : 'SẼ ĐĂNG';
@@ -1986,24 +2052,23 @@
         status = row ? 'SẼ CẬP NHẬT' : 'THIẾU TRÊN WEB';
       }
 
-      const canPrice = ['price_update', 'create'].includes(op);
-      const locked = pricingLocked(item.chapterNo);
+      const locked = canPrice && pricingLocked(item.chapterNo);
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${item.chapterNo}</td>
         <td class="ttlcc-left">${esc(item.title || row?.title || '')}</td>
-        <td>${op === 'price_update' ? Number(row?.wordCount || 0).toLocaleString() : countWordsFromHtml(item.htmlContent).toLocaleString()}</td>
+        <td>${op === 'price_update' ? Number(row?.wordCount || 0).toLocaleString() : bulkItemWordCount(item.chapterNo).toLocaleString()}</td>
         <td>
           ${canPrice ? (
             locked
               ? '<span class="ttlcc-price-lock">FREE · &lt;1000 từ</span>'
               : `<div class="ttlcc-inline-price">
-                   <select data-price-type="${item.chapterNo}">
+                   <select data-price-type="${item.chapterNo}" ${state.running ? 'disabled' : ''}>
                      <option value="free" ${p.type === 'free' ? 'selected' : ''}>FREE</option>
                      <option value="stars" ${p.type === 'stars' ? 'selected' : ''}>Sao</option>
                      <option value="diamond" ${p.type === 'diamond' ? 'selected' : ''}>KC</option>
                    </select>
-                   <input data-price-value="${item.chapterNo}" type="number" min="1" max="10" value="${p.type === 'stars' ? p.value : p.type === 'diamond' ? 1 : ''}" ${p.type === 'stars' ? '' : 'disabled'}>
+                   <input data-price-value="${item.chapterNo}" type="number" min="1" max="10" value="${p.type === 'stars' ? p.value : p.type === 'diamond' ? 1 : ''}" ${p.type === 'stars' && !state.running ? '' : 'disabled'}>
                  </div>`
           ) : '—'}
         </td>
@@ -2016,6 +2081,7 @@
 
     body.querySelectorAll('[data-price-type]').forEach(sel => {
       sel.onchange = () => {
+        if (state.running) return;
         const no = Number(sel.dataset.priceType);
         const input = body.querySelector(`[data-price-value="${no}"]`);
         const p = setPricing(no, sel.value, Number(input?.value || 1));
@@ -2029,6 +2095,7 @@
 
     body.querySelectorAll('[data-price-value]').forEach(inp => {
       inp.onchange = () => {
+        if (state.running) return;
         const no = Number(inp.dataset.priceValue);
         setPricing(no, 'stars', Number(inp.value));
         renderBulkPreview();
@@ -2311,65 +2378,49 @@
   }
 
   async function applyCreatePricingWithExistingEngine(items, verify, stopError, delayMs, labels) {
-    let ok = 0;
+    // BƯỚC CREATE đã reconcile đủ số chương/ID/tên ở phía trên.
+    // Bước này chỉ ghi trường giá của các chapter CẦN đổi.
+    // Không tạo lại chương và không đổi content/title/password.
+    const priceTargets = [];
+    let unchanged = 0;
     let errors = 0;
 
-    for (let i = 0; i < items.length; i++) {
-      if (state.cancelled) {
-        addLog('Đã hủy sau khi tạo batch; dừng trước request giá kế tiếp. Các chương đã tạo vẫn còn trên server.', 'warn');
-        break;
-      }
-
-      const item = items[i];
-      const row = state.chapterMap.get(item.chapterNo);
+    for (const item of items) {
+      const row = state.chapterMap.get(Number(item.chapterNo));
       if (!row) {
         errors++;
         const err = new Error(`Không map được CHƯƠNG ${item.chapterNo} sau native bulk.`);
-        addLog(`${labels.create} LỖI CHƯƠNG ${item.chapterNo}: ${err.message}`, 'error');
+        addLog(`${labels.create} LỖI: ${err.message}`, 'error');
         if (stopError) throw err;
         continue;
       }
-
-      const targetP = getPricing(item.chapterNo);
-      try {
-        if (!priceMatchesRow(targetP, row)) {
-          setStatus(`ÁP GIÁ ${i + 1}/${items.length}: CHƯƠNG ${item.chapterNo}`);
-          const snap = await fetchChapterSnapshot(row, true);
-          const pf = pricingFields(targetP, item.chapterNo);
-          const expected = {
-            stars: Number(pf.stars_active || 0),
-            diamonds: Number(pf.diamonds_active || 0),
-          };
-
-          await submitChapterOverrides(snap, {
-            stars_active: pf.stars_active,
-            diamonds_active: pf.diamonds_active,
-          }, `GIÁ CHƯƠNG ${item.chapterNo}`);
-
-          if (verify) {
-            await sleep(350 + jitter(180));
-            await verifyChapter(row, expected);
-          }
-        }
-
-        ok++;
-        addLog(`${labels.create} OK: CHƯƠNG ${item.chapterNo} · ${pricingLabel(targetP)}`, 'ok');
-      } catch (err) {
-        errors++;
-        addLog(`ÁP GIÁ LỖI CHƯƠNG ${item.chapterNo}: ${err.message}`, 'error');
-        if (stopError) throw err;
-      }
-
-      if (i + 1 < items.length) {
-        if ((i + 1) % CFG.bulkCooldownEvery === 0) {
-          await sleep(CFG.bulkCooldownMs);
-        } else if (delayMs) {
-          await sleep(delayMs + jitter(220));
-        }
+      if (priceMatchesRow(getPricing(item.chapterNo), row)) {
+        unchanged++;
+      } else {
+        priceTargets.push(item);
       }
     }
 
-    return { ok, errors };
+    if (!priceTargets.length) {
+      if (state.cancelled) throw new Error('Đã hủy sau native bulk; chương đã đăng vẫn còn trên server.');
+      addLog(`Hậu kiểm giá: ${unchanged} chương đã đúng; không cần request sửa giá.`, 'ok');
+      return { ok: unchanged, errors };
+    }
+
+    const priceLabels = { ...labels, price_update: 'ÁP GIÁ SAU ĐĂNG' };
+    const result = await runParallelChapterUpdates(
+      priceTargets, 'price_update', verify, stopError, delayMs, priceLabels
+    );
+
+    // Chỉ những chương PASS + vốn đúng giá mới được tính thành công.
+    // Nếu hủy giữa pha write, không được báo đã xong toàn bộ.
+    if (result.unstarted > 0 || (state.cancelled && unchanged + result.completed < items.length)) {
+      throw new Error(
+        `Áp giá sau đăng chưa hoàn tất: PASS ${unchanged + result.ok}/${items.length}, ` +
+        `chưa ghi ${result.unstarted}. Chương đã đăng vẫn tồn tại trên web.`
+      );
+    }
+    return { ok: unchanged + result.ok, errors: errors + result.errors };
   }
 
   async function runNativeBulkCreate(items, verify, stopError, delayMs, labels) {
@@ -2457,7 +2508,9 @@
 
 
   function isParallelChapterUpdateOperation(op) {
-    return ['both', 'title', 'content'].includes(op);
+    // Giá dùng đúng cơ chế PREPARE/WRITE/VERIFY/recovery của nội dung.
+    // Vẫn chỉ 2 PUT song song; không bỏ bảo vệ PUT-response bất định.
+    return ['both', 'title', 'content', 'price_update'].includes(op);
   }
 
   function isTransientUpdateError(err) {
@@ -2471,6 +2524,16 @@
   function buildExistingChapterUpdate(item, op) {
     const overrides = {};
     const expected = {};
+
+    if (op === 'price_update') {
+      // Cùng pricingFields() của engine cũ: 0..10 sao / 1 KC /
+      // buộc FREE nếu <1000 từ; không đụng name/content/pass/schedule.
+      const fields = pricingFields(getPricing(item.chapterNo), item.chapterNo);
+      overrides.stars_active = fields.stars_active;
+      overrides.diamonds_active = fields.diamonds_active;
+      expected.stars = Number(fields.stars_active || 0);
+      expected.diamonds = Number(fields.diamonds_active || 0);
+    }
 
     if (op === 'both' || op === 'title') {
       overrides.name_chapter = sanitizeChapterTitle(item.title, item.chapterNo);
@@ -2796,6 +2859,12 @@
           entry.snapshot = await fetchChapterSnapshot(entry.row, true);
           entry.prepared = true;
           preparedCount++;
+          if (op === 'price_update' &&
+              entry.snapshot.currentStars === entry.expected.stars &&
+              entry.snapshot.currentDiamonds === entry.expected.diamonds) {
+            entry.noWriteNeeded = true;
+            entry.verified = true;  // form GET mới nhất đã đúng target giá.
+          }
 
           if (Number(state.netRetrySeq || 0) > seqBefore) {
             entry.degraded = true;
@@ -2834,10 +2903,21 @@
       );
     }
 
-    const writable = entries.filter(e => e.prepared && !e.finalError);
+    const writable = entries.filter(e => e.prepared && !e.finalError && !e.noWriteNeeded);
+    const alreadyCorrect = entries.filter(e => e.noWriteNeeded && !e.finalError);
 
     if (!writable.length) {
-      throw new Error(`${labels[op]}: không có chapter nào đủ điều kiện WRITE.`);
+      const failed = entries.filter(e => e.finalError);
+      addLog(`${labels[op]}: giá đã đúng ${alreadyCorrect.length}; không phát sinh PUT.`, 'ok');
+      return {
+        ok: alreadyCorrect.length,
+        errors: failed.length,
+        completed: alreadyCorrect.length + failed.length,
+        unstarted: 0,
+        clean: alreadyCorrect.length,
+        degraded: 0,
+        ambiguousWrites: 0,
+      };
     }
 
     addLog(
@@ -3054,9 +3134,11 @@
       }
     }
 
-    const successful = written.filter(e => e.verified && !e.finalError);
+    const successful = entries.filter(e =>
+      !e.finalError && e.verified && (e.noWriteNeeded || e.writeAttempted)
+    );
     const failed = entries.filter(e => e.finalError || (e.writeAttempted && !e.verified));
-    const notWritten = entries.filter(e => !e.writeAttempted);
+    const notWritten = entries.filter(e => !e.writeAttempted && !e.noWriteNeeded && !e.finalError);
 
     const clean = successful.filter(e => !e.degraded).length;
     const degraded = successful.length - clean;
@@ -3087,8 +3169,51 @@
     };
   }
 
+  function setBulkControlsLocked(locked) {
+    // Không khóa Cancel, Log, hay các bộ lọc chỉ đọc.
+    const selectors = [
+      '#ttlcc-bulk-operation', '#ttlcc-bulk-from', '#ttlcc-bulk-to',
+      '#ttlcc-bulk-file', '#ttlcc-bulk-text', '#ttlcc-bulk-parse',
+      '#ttlcc-price-from', '#ttlcc-price-to', '#ttlcc-price-type',
+      '#ttlcc-price-value', '#ttlcc-price-apply',
+      '#ttlcc-price-alt-star', '#ttlcc-price-alt-kc',
+      '#ttlcc-bulk-delay', '#ttlcc-bulk-verify', '#ttlcc-bulk-stop-error',
+    ];
+    for (const selector of selectors) {
+      const el = $(selector);
+      if (el) el.disabled = !!locked;
+    }
+    // Giữ nguyên semantics: loại FREE/KC không cho sửa số sao.
+    if (!locked) {
+      const type = $('#ttlcc-price-type')?.value;
+      const value = $('#ttlcc-price-value');
+      if (value) value.disabled = type !== 'stars';
+    }
+    renderBulkPreview();
+  }
+
+  // Guard đặt trước cả GET preflight. Tránh bấm liên tục tạo hai batch
+  // trong khoảng thời gian script còn đang load chapter mà chưa khóa nút.
   async function runBulk() {
     if (state.running) return;
+    if (state.bulkLoading) return toast('TXT vẫn đang được đọc. Hãy hoàn tất nạp file trước khi chạy.', 'warn');
+    if (!state.selectedStoryId) return toast('Chưa chọn truyện.', 'warn');
+    state.running = true;
+    setBulkControlsLocked(true);
+    const btn = $('#ttlcc-bulk-run');
+    if (btn) btn.disabled = true;
+    try {
+      return await runBulkCore();
+    } finally {
+      state.running = false;
+      setBulkControlsLocked(false);
+      if (btn) btn.disabled = false;
+      const cancel = $('#ttlcc-bulk-cancel');
+      if (cancel) cancel.disabled = true;
+    }
+  }
+
+  async function runBulkCore() {
     if (!state.selectedStoryId) return toast('Chưa chọn truyện.', 'warn');
 
     const op = bulkOperation();
@@ -3151,13 +3276,16 @@
 
     const confirmExtra = op === 'create'
       ? '\n\nChương sẽ được tạo hàng loạt, kiểm tra lại, rồi áp giá đã chọn.'
-      : isParallelChapterUpdateOperation(op)
-        ? '\n\nNội dung sẽ được cập nhật và kiểm tra lại sau khi lưu.'
-        : '';
+      : op === 'price_update'
+        ? '\n\nChỉ thay đổi Sao/KC, giữ nguyên nội dung/tên/pass và đối chiếu giá sau lưu.'
+        : isParallelChapterUpdateOperation(op)
+          ? '\n\nNội dung sẽ được cập nhật và kiểm tra lại sau khi lưu.'
+          : '';
     if (!confirm(`${labels[op]}\n\nTruyện #${state.selectedStoryId} · ${items.length} chương${confirmExtra}\n\nTiếp tục?`)) return;
 
     state.running = true;
     state.cancelled = false;
+    setBulkControlsLocked(true);
     const runBtn = $('#ttlcc-bulk-run');
     const cancelBtn = $('#ttlcc-bulk-cancel');
     if (runBtn) runBtn.disabled = true;
@@ -3178,55 +3306,14 @@
         const result = await runParallelChapterUpdates(items, op, verify, stopError, delayMs, labels);
         ok += result.ok;
         errors += result.errors;
-      } else {
-        // price_update giữ nguyên engine tuần tự cũ để không thay semantics pricing trong patch này.
-        for (let i = 0; i < items.length; i++) {
-          if (state.cancelled) {
-            addLog('Bulk: đã hủy trước request kế tiếp.', 'warn');
-            break;
-          }
-
-          const item = items[i];
-          setStatus(`${labels[op]} ${i + 1}/${items.length}: CHƯƠNG ${item.chapterNo}`);
-
-          try {
-            const row = state.chapterMap.get(item.chapterNo);
-            const snap = await fetchChapterSnapshot(row, true);
-            const overrides = {};
-            const expected = {};
-
-            if (op === 'price_update') {
-              const pf = pricingFields(getPricing(item.chapterNo), item.chapterNo);
-              overrides.stars_active = pf.stars_active;
-              overrides.diamonds_active = pf.diamonds_active;
-              expected.stars = Number(pf.stars_active || 0);
-              expected.diamonds = Number(pf.diamonds_active || 0);
-            } else {
-              throw new Error(`Operation "${op}" chưa có engine xử lý.`);
-            }
-
-            await submitChapterOverrides(snap, overrides, `UPDATE CHƯƠNG ${item.chapterNo}`);
-            if (verify) {
-              await sleep(350 + jitter(180));
-              await verifyChapter(row, expected);
-            }
-
-            ok++;
-            addLog(`${labels[op]} OK: CHƯƠNG ${item.chapterNo}`, 'ok');
-          } catch (err) {
-            errors++;
-            addLog(`${labels[op]} LỖI CHƯƠNG ${item.chapterNo}: ${err.message}`, 'error');
-            if (stopError) throw err;
-          }
-
-          if (i + 1 < items.length) {
-            if ((i + 1) % CFG.bulkCooldownEvery === 0) {
-              await sleep(CFG.bulkCooldownMs);
-            } else if (delayMs) {
-              await sleep(delayMs + jitter(220));
-            }
-          }
+        if (result.unstarted > 0 || (state.cancelled && result.completed < items.length)) {
+          throw new Error(
+            `Batch chưa hoàn tất: PASS ${result.ok}/${items.length}, ` +
+            `chưa ghi ${result.unstarted}. Đã hậu kiểm các request đã gửi.`
+          );
         }
+      } else {
+        throw new Error(`Operation "${op}" không được hỗ trợ.`);
       }
 
       // Cho server lắng ngắn trước khi quét lại danh sách sau update.
@@ -3248,7 +3335,7 @@
       state.running = false;
       if (runBtn) runBtn.disabled = false;
       if (cancelBtn) cancelBtn.disabled = true;
-      renderBulkPreview();
+      setBulkControlsLocked(false);
     }
   }
 
@@ -4910,6 +4997,7 @@
   }
 
   function syncBulkOperationUi() {
+    if (state.running) return;
     const op = bulkOperation();
     state.bulk.operation = op;
     const txt = $('#ttlcc-bulk-txt-card');
@@ -5032,20 +5120,34 @@
       renderBulkPreview();
     };
     $('#ttlcc-bulk-file').onchange = async e => {
+      if (state.running) return;
       const files = [...(e.target.files || [])];
       if (!files.length) return;
 
       try {
         await loadBulkTxtFiles(files);
       } catch (err) {
-        state.bulk.parsed = [];
-        state.bulk.pricing.clear();
+        // Giữ batch hợp lệ trước đó; tránh vô tình dùng dữ liệu vừa lỗi.
         toast(`Nạp TXT lỗi: ${err.message}`, 'error', 8000);
         renderBulkPreview();
       }
     };
 
+    // Chỉnh textarea làm parsed cũ không còn khớp nội dung; bắt buộc parse lại.
+    $('#ttlcc-bulk-text').addEventListener('input', () => {
+      if (state.running) return;
+      state.bulkLoadSeq++;
+      state.bulkLoading = false;
+      state.bulk.parsed = [];
+      state.bulk.pricing.clear();
+      renderBulkPreview();
+    });
+
     $('#ttlcc-bulk-parse').onclick = () => {
+      if (state.running) return;
+      // Parse tay là nguồn dữ liệu mới, không cho load file cũ ghi đè.
+      state.bulkLoadSeq++;
+      state.bulkLoading = false;
       try {
         const parsed = parseTxtBatch($('#ttlcc-bulk-text').value);
         applyParsedTxtBatch(parsed, `Parse OK: ${parsed.length} chương.`);
@@ -5091,7 +5193,7 @@
 
   async function start() {
     injectUi();
-    addLog(`Control Center v${VERSION} khởi động.`);
+    addLog(`Control Center v${VERSION} khởi động · phased-price/price-after-create · multi-TXT · verified recovery.`);
     setStatus('Đang tải dữ liệu quản lý…');
 
     try {
