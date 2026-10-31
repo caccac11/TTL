@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trích Tinh Lâu - Control Center Toàn Diện
 // @namespace    https://github.com/caccac11/TTL
-// @version      1.4.4
+// @version      1.4.5
 // @description  TTL Control: giao diện phẳng một trục cuộn, bulk native an toàn, update pipeline no-follow, quản lý truyện/chương/doanh thu.
 // @match        https://trichtinhlau.com/*
 // @homepageURL  https://github.com/caccac11/TTL
@@ -24,7 +24,7 @@
   if (window.__TTL_CONTROL_CENTER__) return;
   window.__TTL_CONTROL_CENTER__ = true;
 
-  const VERSION = '1.4.4';
+  const VERSION = '1.4.5';
   const ORIGIN = location.origin;
   const STORE_KEY = 'ttl-control-center-v1';
 
@@ -2596,6 +2596,24 @@
         // của attempt lỗi trước.
         const snap = await fetchChapterSnapshot(row, true);
 
+        // PRICE recovery: nếu VERIFY trước đó quan sát dữ liệu trễ nhưng
+        // server đã commit sau đó, KHÔNG gửi PUT lần hai. Đây là GET form
+        // mới nhất và so sánh đồng thời cả Sao lẫn KC.
+        if (op === 'price_update' &&
+            Number(snap.currentStars) === Number(expected.stars) &&
+            Number(snap.currentDiamonds) === Number(expected.diamonds)) {
+          healthReasons.add('price-late-commit-confirmed');
+          addLog(`${prefix}: server đã có đúng giá khi đọc lại; bỏ qua PUT recovery.`, 'warn');
+          return {
+            row,
+            expected,
+            attempts: attempt,
+            recoveredAfterWriteError: false,
+            degraded: true,
+            healthReasons: [...healthReasons],
+          };
+        }
+
         try {
           await submitChapterOverrides(
             snap,
@@ -2798,15 +2816,24 @@
     const requestGap = Math.max(180, Number(CFG.bulkUpdateRequestGapMs || 300));
     const phaseCooldown = Math.max(400, Number(CFG.bulkUpdatePhaseCooldownMs || 650));
     const prepareConcurrency = clamp(Number(CFG.bulkUpdatePrepareConcurrency || 2), 1, 2);
-    const writeConcurrency = clamp(Number(CFG.bulkUpdateWriteConcurrency || 2), 1, 2);
+    const priceWriteSerial = op === 'price_update';
+    // Thực nghiệm 2026-10-31: 2 PUT giá đồng thời cho 17 chương chỉ 2 PASS
+    // khi VERIFY, nhưng 15/15 PASS khi RECOVERY tuần tự. Không dùng
+    // concurrency=2 cho WRITE giá trước khi server chứng minh hỗ trợ an toàn.
+    const writeConcurrency = priceWriteSerial
+      ? 1
+      : clamp(Number(CFG.bulkUpdateWriteConcurrency || 2), 1, 2);
     const verifyConcurrency = clamp(Number(CFG.bulkUpdateVerifyConcurrency || 2), 1, 2);
 
-    // Delay UI vẫn có tác dụng, nhưng không để default 1000ms làm pipeline giật cục.
-    // Nó chỉ có thể nâng pacing request lên tối đa 600ms.
+    // Delay UI vẫn có tác dụng nhưng không để default 1100ms làm pipeline giật.
+    // PREPARE/VERIFY giữ pacing gốc; giá dùng PUT tuần tự khoảng cách 800ms.
     const effectiveGap = Math.max(
       requestGap,
       Math.min(Math.max(0, Number(delayMs || 0)), 450)
     );
+    const writeGap = priceWriteSerial
+      ? Math.max(800, effectiveGap)
+      : effectiveGap;
 
     const entries = items.map(item => {
       const row = state.chapterMap.get(item.chapterNo);
@@ -2833,7 +2860,7 @@
     addLog(
       `${labels[op]}: pipeline mượt PREPARE→WRITE→VERIFY · ` +
       `GET=${prepareConcurrency}, PUT=${writeConcurrency}, VERIFY=${verifyConcurrency} luồng · ` +
-      `no-follow-redirect=ON · gap=${effectiveGap}ms · ${items.length} chương · ` +
+      `no-follow-redirect=ON · GET gap=${effectiveGap}ms · PUT gap=${writeGap}ms · ${items.length} chương · ` +
       `verify=${verify ? 'ON' : 'OFF'}.`,
       'info'
     );
@@ -2937,7 +2964,7 @@
       name: `${labels[op]} WRITE`,
       entries: writable,
       concurrency: writeConcurrency,
-      startGapMs: effectiveGap,
+      startGapMs: writeGap,
       stopOnTaskError: false,
       respectCancel: true,
       task: async (entry) => {
@@ -2996,7 +3023,12 @@
       ambiguousWrites ? 'warn' : 'ok'
     );
 
-    await sleep(phaseCooldown + jitter(220));
+    // Sau PUT giá, đợi commit ổn định một khoảng cố định trước khi GET
+    // VERIFY; điều này không thay thế verify và không mặc định coi HTTP OK
+    // là server đã ghi giá.
+    await sleep(priceWriteSerial
+      ? Math.max(1200, phaseCooldown) + jitter(180)
+      : phaseCooldown + jitter(220));
 
     // -------------------- PHASE 3: VERIFY --------------------
     // Verify=OFF vẫn bắt buộc hậu kiểm những PUT response bị rớt.
@@ -3023,7 +3055,8 @@
             const vr = await verifyChapterWithRetry(
               entry.row,
               entry.expected,
-              `CHƯƠNG ${entry.item.chapterNo} phased-verify`
+              `CHƯƠNG ${entry.item.chapterNo} phased-verify`,
+              priceWriteSerial ? Math.min(2, CFG.bulkUpdateVerifyAttempts) : CFG.bulkUpdateVerifyAttempts
             );
 
             entry.verified = true;
